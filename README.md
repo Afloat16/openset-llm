@@ -216,6 +216,19 @@ or at start-up (`--portable`, one binary for all x86-64). A CPU without the fast
   machine. With `--ctx` above 4096 on a machine (or container limit) under 12 GB, `serve` turns speculation off by
   itself (above 8192 with `--kv8`): there the draft state does not fit next to the KV cache and plain decoding is faster.
   `--ctx 16384` then runs plain decoding with ~0.45 GB free (measured). With 16 GB, speculation stays on to 32k.
+- **Longer context on 8 GB (experimental, opt-in):** a smaller attention cache leaves room for more context and
+  keeps speculation on further. Pick one flag; none of them is exact, and `--kv6` / `--kv5` need AVX-512.
+
+  | `./serve` flag | attention cache vs default | speculation stays on to | plain decoding to | WikiText PPL (default 7.5702) | GSM8K-40 / coding pass@1 (default 39 / 83.1 %) |
+  |---|---|---|---|---|---|
+  | `--kv8` (int8) | 57 % | 8k | 32k | 7.5678 | – |
+  | `--kv6` (6-bit) | 38 % | 12k (10.5–11.0 tok/s at full 12k–14k prompts) | 32k (5.7 tok/s, 0.7 GB free) | 7.5713 | 39 / 83.8 % |
+  | `--kv5` (5-bit) | 32 % | 16k (9.0–11.1 tok/s at a full 16k prompt, ~0.1 GB free) | 64k (3.9–4.5 tok/s, ~0.1 GB free) | 7.5729 | 39 / 83.1 % |
+
+  Measured 2026-11-21 on 8 vCPU / 8 GB Ice Lake boxes (the only CPU class tested). A planted-facts recall test scored
+  8/8 at 16k, 32k and 64k with both new formats; `--multi` and agent-loop resume give the same replies with them as
+  without. `serve` refuses contexts past these limits on machines under 12 GB. At 64k expect about 50 minutes to read
+  a full prompt the first time.
 - `./serve` turns off llama-server's host prompt cache (`--cache-ram 0`, default 8 GiB) and keeps one context
   checkpoint (`--ctx-checkpoints 1`); the defaults OOM an 8 GB box.
 - `install.sh` refuses to run below 8 GB of RAM (or a container memory limit below that), and needs ~15 GB of free disk
@@ -236,7 +249,8 @@ A patch set on PrismML's llama.cpp fork (pinned at `e3de715`), applied by `insta
 
 Defaults are the fastest settings. Switches: `./serve --no-spec` (plain decoding), `--no-resume`, `--multi N`,
 `--think`, `--ctx N`, and `--kv8` (experimental, opt-in: a smaller, int8 attention cache; 43 % less cache memory, which is what lets
-speculation stay on at `--ctx 8192` on an 8 GB machine; not exact: WikiText PPL 7.5678 vs 7.5702).
+speculation stay on at `--ctx 8192` on an 8 GB machine; not exact: WikiText PPL 7.5678 vs 7.5702) or its smaller
+siblings `--kv6` / `--kv5` (6- and 5-bit; [Memory budget](#memory-budget-8-gb-machine) has the limits and numbers).
 
 ## Several requests at once (`--multi`)
 
@@ -320,7 +334,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 - **Hardware:** the fast path needs x86 with AVX-512 VNNI + VBMI (table above). Measured on Intel Ice Lake, AMD Zen 4
   and Zen 5. The 8 vCPU of our Ice Lake test boxes behave like 8 physical cores; a typical cloud 8 vCPU (AWS / GCP / Azure) is 4 cores, so
   expect lower absolute speed there.
-- **8 GB is the floor:** 4k context by default; above 4k on < 12 GB, `serve` uses plain decoding (above 8k with `--kv8`).
+- **8 GB is the floor:** 4k context by default; above 4k on < 12 GB, `serve` uses plain decoding (above 8k with `--kv8`,
+  12k with `--kv6`, 16k with `--kv5`). The compact caches are experimental and were measured on one CPU class.
 - **Speculation changes a reply only at near-ties:** greedy replies are byte-identical to plain decoding on 17/24 of
   the benchmark prompts and 75/128 of a broader set; task scores are the same (Numbers).
 - **Speed depends on the text and the machine.** Speculative decoding gains most on text the model finds predictable

@@ -12,13 +12,15 @@
 #    = prefix states on disk). See README.md "What is inside".
 # 9. 0008-*.patch: our attention kernel (kernels/attn-fast.inc) for FLASH_ATTN_EXT (GGML_ATTN=0 = the fork's paths), and
 #    q8_K as a KV cache type (int8 KV, opt-in). GGML_ATTN=0 selects the fork's paths.
+# 10. 0009-*.patch: kv5 / kv6 KV cache types (kernels/kvq.h: 5 / 6-bit rows read by attn-fast.inc; opt-in,
+#    `serve --kv6` / `--kv5`).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 src=${1:?usage: apply.sh <llama.cpp checkout>}
 cp "$here"/../kernels/ptq1-common.h "$here"/../kernels/ptq1-drop.h "$here"/../kernels/ptq1-fast.inc "$here"/../kernels/ptq1-panel.inc \
-   "$here"/../kernels/ptq1-vbmi.inc "$here"/../kernels/x1-q4k.inc "$here"/../kernels/attn-fast.inc "$src/ggml/src/ggml-cpu/"
+   "$here"/../kernels/ptq1-vbmi.inc "$here"/../kernels/x1-q4k.inc "$here"/../kernels/attn-fast.inc "$here"/../kernels/kvq.h "$src/ggml/src/ggml-cpu/"
 git -C "$src" checkout -q -- ggml/src/ggml-cpu/ggml-cpu.c ggml/src/ggml-cpu/ops.cpp src/models/qwen35.cpp \
-   src/llama-context.cpp tools/server/server-context.cpp common/chat.h common/common.h common/arg.cpp
+   src/llama-context.cpp tools/server/server-context.cpp common/chat.h common/common.h common/arg.cpp ggml/include/ggml.h ggml/src/ggml.c
 for p in "$here"/0*.patch; do
   git -C "$src" apply "$p" && echo "applied: $(basename "$p")"
 done

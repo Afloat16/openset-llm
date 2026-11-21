@@ -7,9 +7,13 @@
 #   ./serve --no-webui            # API only: do not serve the chat page at /
 #   ./serve --no-spec             # plain decoding (no speculation)
 #   ./serve --spec                # keep speculation on where serve would turn it off: for lack of memory
-#                                 #   (< 12 GB RAM: --ctx > 4096 without --kv8, > 8192 with) or on a CPU without AVX-512 VNNI
+#                                 #   (< 12 GB RAM: --ctx > 4096; > 8192 with --kv8; > 12288 with --kv6; > 16384 with --kv5)
+#                                 #   or on a CPU without AVX-512 VNNI
 #   ./serve --think               # let the model think before answering (much longer replies)
 #   ./serve --no-resume           # turn off agent-loop resume (default on; saved prefix states live in $OPENSET_LLM_HOME/state)
+#   ./serve --kv6 | --kv5         # EXPERIMENTAL: 6- / 5-bit attention cache, 38 % / 32 % of the default cache; on 8 GB:
+#                                 #   speculation up to 12k (kv6) / 16k (kv5) context, plain decoding to 32k (kv6) / 64k (kv5);
+#                                 #   not exact; needs AVX-512; choose one of --kv8, --kv6, --kv5
 #   ./serve --kv8                 # EXPERIMENTAL: int8 attention cache: 43 % less cache memory, helps on long prompts; not exact
 #   ./serve --fl128               # EXPERIMENTAL: a faster variant that is not bit-identical
 #   ./serve --spec-adapt          # EXPERIMENTAL: adaptive draft depth (--spec-depth N; default 3, 5 on >= 12 GB RAM)
@@ -19,7 +23,7 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PREFIX=${OPENSET_LLM_HOME:-$HOME/.openset-llm}
-HOST=127.0.0.1; PORT=8080; CTX=; THREADS=$(nproc); SPEC=1; SPEC_FORCE=0; X1=1; MULTI=0; THINK=off; EXTRA=(); ADAPT=0; DEPTH=; FL128=0; KV8=0; RESUME=1; WEBUI=1
+HOST=127.0.0.1; PORT=8080; CTX=; THREADS=$(nproc); SPEC=1; SPEC_FORCE=0; X1=1; MULTI=0; THINK=off; EXTRA=(); ADAPT=0; DEPTH=; FL128=0; KV8=0; KVQ=0; RESUME=1; WEBUI=1
 while [ $# -gt 0 ]; do
   case $1 in
     --host|--port|--ctx|--threads|--multi|--spec-depth) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;&
@@ -36,10 +40,11 @@ while [ $# -gt 0 ]; do
     --spec-depth) DEPTH=$2; shift ;;
     --fl128) FL128=1 ;;
     --kv8) KV8=1 ;;
+    --kv6|--kv5) [ "$KVQ" = 0 ] || { echo "choose one of --kv8, --kv6, --kv5" >&2; exit 2; }; KVQ=${1#--kv} ;;
     --no-resume) RESUME=0 ;;
     --no-webui) WEBUI=0 ;;
     --) shift; EXTRA=("$@"); break ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (pass llama-server flags after --)" >&2; exit 2 ;;
   esac
   shift
@@ -67,9 +72,9 @@ if [ "$MULTI" -ge 2 ]; then
   fi
 else
   NP=1; CTX=${CTX:-4096}; CTX_TOTAL=$CTX
-  if [ "$CTX" -gt 8192 ]; then
+  if [ "$CTX" -gt 8192 ] && [ "$KV8" = 0 ] && [ "$KVQ" = 0 ]; then
     echo "warning: --ctx $CTX > 8192. On an 8 GB machine the KV cache and recurrent-state checkpoints can push the" >&2
-    echo "         server past RAM; 8192 is the measured-safe limit there." >&2
+    echo "         server past RAM; 8192 is the measured-safe limit there (--kv8, --kv6 or --kv5 go further)." >&2
   fi
 fi
 args=(-m "$MODEL" -t "$THREADS" -c "$CTX_TOTAL" -ub 256 -np "$NP"
@@ -102,16 +107,37 @@ if [ "$SPEC" = 1 ] && [ "$MULTI" -lt 2 ] && [ "$SPEC_FORCE" = 0 ]; then
        SPEC=0 ;;
   esac
 fi
+[ "$KV8" = 1 ] && [ "$KVQ" != 0 ] && { echo "choose one of --kv8, --kv6, --kv5" >&2; exit 2; }
+if [ "$KVQ" != 0 ]; then
+  # the 6- / 5-bit rows are read by the AVX-512 attention kernel only; the int8 cache (--kv8) also runs without it
+  case " $(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2) " in
+    *" avx512bw "*) ;;
+    *) echo "--kv$KVQ needs a CPU with AVX-512; on this CPU use --kv8 (int8 attention cache) instead" >&2; exit 2 ;;
+  esac
+  # measured on 8 vCPU / 8 GB (2026-11-21): kv6 runs to 32k and kv5 to 64k with ~0.1-0.7 GB to spare; past that the
+  # server is OOM-killed at load or stalls
+  KVQ_CTX_MAX=32768; [ "$KVQ" = 5 ] && KVQ_CTX_MAX=65536
+  if [ "$MEM_KB" -lt 12000000 ] && [ "$CTX_TOTAL" -gt "$KVQ_CTX_MAX" ]; then
+    echo "--ctx $CTX_TOTAL with --kv$KVQ does not fit in < 12 GB of RAM: the measured limit is $KVQ_CTX_MAX" >&2; exit 2
+  fi
+fi
 [ "$KV8" = 1 ] && args+=(-ctk q8_K -ctv q8_K)   # needs patch 0008 (attn-fast.inc); f16 KV is the exact default
+[ "$KVQ" != 0 ] && args+=(-ctk "kv$KVQ" -ctv "kv$KVQ")   # patch 0009 (kvq.h): 6- / 5-bit rows, 38 % / 32 % of the f16 cache
+# measured on 8 GB. kv6 at a full 16k context pages (5.8-6.7 tok/s, slower than plain decoding); it holds to 14k, kv5 to 16k
+SPEC_CTX_MAX=4096; [ "$KV8" = 1 ] && SPEC_CTX_MAX=8192; [ "$KVQ" = 6 ] && SPEC_CTX_MAX=12288; [ "$KVQ" = 5 ] && SPEC_CTX_MAX=16384
 if [ "$SPEC" = 1 ] && [ "$MULTI" -lt 2 ] && [ "$SPEC_FORCE" = 0 ] && \
-   { [ "$CTX" -gt 8192 ] || { [ "$CTX" -gt 4096 ] && [ "$KV8" = 0 ]; }; } && \
+   [ "$CTX" -gt "$SPEC_CTX_MAX" ] && \
    [ "$MEM_KB" -lt 12000000 ]; then
   # with patch 0008 the verify batch is fast at any depth (16 GB: MTP 1.6-1.7x plain at 4k-32k), but on 8 GB the draft
   # state + f16 KV leave < 0.1 GB free above 4k and page reclaim makes MTP slower than plain decode (8k: 6.5 vs 7.5 tok/s);
   # with --kv8 the int8 KV leaves room and MTP wins again at 8k (10.9 tok/s); at 16k MTP does not fit 8 GB either way.
   # (measured 2026-11-10 on an 8 vCPU / 8 GB Ice Lake box)
   echo "note: --ctx $CTX on < 12 GB RAM: speculation off (it is slower than plain decode here or does not fit: memory);" >&2
-  echo "      up to --ctx 8192, --kv8 (int8 attention cache) keeps it on and helps on long prompts; --spec forces it" >&2
+  if [ "$KV8" = 0 ] && [ "$KVQ" = 0 ]; then
+    echo "      a compact attention cache keeps it on further: --kv8 to 8192, --kv6 to 12288, --kv5 to 16384; --spec forces it" >&2
+  else
+    echo "      the limit with this cache is --ctx $SPEC_CTX_MAX (--kv8 8192, --kv6 12288, --kv5 16384); --spec forces it" >&2
+  fi
   SPEC=0
 fi
 if [ "$SPEC" = 1 ]; then

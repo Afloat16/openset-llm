@@ -3,8 +3,9 @@
 //
 // One kernel for every query count M (1 decode, 4 MTP verify, up to the ubatch in prefill), GQA-grouped: the G query
 // heads of a KV head and all M query positions form R = M*G rows that share every K/V row read. Streaming (online)
-// softmax, nothing materialised. KV types: F16 (exact mode: f32 math on converted tiles) and Q8_K (int8 mode, opt-in via
-// `-ctk q8_K -ctv q8_K`: one f32 scale per (token, head) row of 256; Q·K as u8 x s8 VNNI dot products in int32, P·V in f32).
+// softmax, nothing materialised. KV types: F16 (exact mode: f32 math on converted tiles), Q8_K (int8 mode, opt-in via
+// `-ctk q8_K -ctv q8_K`: one f32 scale per (token, head) row of 256; Q·K as u8 x s8 VNNI dot products in int32, P·V in f32)
+// and KV4 / KV5 / KV6 (kvq.h: 4 / 5 / 6-bit rows, `-ctk kv6 -ctv kv6`; unpacked to int8 tiles, then the int8 paths).
 //
 // Canonical order. Every query row is computed by the same sequence of float operations whatever M is, however the
 // rows are blocked and however the work is split across threads: keys are cut into absolute chunks of ATTNF_CHUNK
@@ -38,11 +39,15 @@
 #define ATTNF_DMAX  512    // max head size (DK, DV), multiple of 64
 
 typedef struct { float d; int8_t qs[256]; int16_t bsums[16]; } attnf_q8k;   // = block_q8_K (checked at run time)
+#include "kvq.h"   // GGML_TYPE_KV4 / KV5 / KV6: b-bit rows, unpacked to int8 tiles here, then the int8 paths
+static inline int attnf_kvq_bits(enum ggml_type t) { return t == GGML_TYPE_KV4 ? 4 : t == GGML_TYPE_KV5 ? 5 : t == GGML_TYPE_KV6 ? 6 : 0; }
+static inline bool attnf_is_i8(enum ggml_type t) { return t == GGML_TYPE_Q8_K || attnf_kvq_bits(t) != 0; }
+static inline size_t attnf_blk(enum ggml_type t) { const int b = attnf_kvq_bits(t); return b ? kvq_block_size(b) : sizeof(attnf_q8k); }
 
 typedef struct {
     const char * k; size_t nbk;   // key row t of this KV head: k + t*nbk
     const char * v; size_t nbv;
-    enum ggml_type type;          // GGML_TYPE_F16 or GGML_TYPE_Q8_K, same for K and V
+    enum ggml_type type;          // GGML_TYPE_F16, GGML_TYPE_Q8_K or GGML_TYPE_KV4/5/6, same for K and V
     int dk, dv;
 } attnf_kv;
 
@@ -61,13 +66,14 @@ typedef struct {
     float   kd[ATTNF_T], vd[ATTNF_T];
     int32_t kc[ATTNF_T];
     const int8_t * kq[ATTNF_T];
+    int8_t * K8;      // [T][DMAX]      kv4/5/6: K tile unpacked to int8 levels
 } attnf_ws;
 
 static attnf_ws * attnf_ws_get(void) {
     static thread_local attnf_ws * ws = NULL;
     if (ws) return ws;
     const size_t RD = (size_t) ATTNF_RMAX * ATTNF_DMAX, TD = (size_t) ATTNF_T * ATTNF_DMAX, RT = (size_t) ATTNF_RMAX * ATTNF_T;
-    const size_t bytes = sizeof(float) * (RD + ATTNF_RMAX + TD + TD + RT + RT + RD + RD) + 2 * RD + 64 * 16;
+    const size_t bytes = sizeof(float) * (RD + ATTNF_RMAX + TD + TD + RT + RT + RD + RD) + 2 * RD + TD + 64 * 16;
     char * p = (char *) aligned_alloc(64, (bytes + 63) / 64 * 64);
     if (!p) return NULL;
     attnf_ws * w = (attnf_ws *) aligned_alloc(64, (sizeof(attnf_ws) + 63) / 64 * 64);
@@ -77,6 +83,7 @@ static attnf_ws * attnf_ws_get(void) {
     ATTNF_TAKE(w->Q, float, RD);  ATTNF_TAKE(w->Qu, uint8_t, RD); ATTNF_TAKE(w->Qu2, uint8_t, RD); ATTNF_TAKE(w->dQ, float, ATTNF_RMAX);
     ATTNF_TAKE(w->Kt, float, TD); ATTNF_TAKE(w->Vt, float, TD);   ATTNF_TAKE(w->S, float, RT);
     ATTNF_TAKE(w->Mt, float, RT); ATTNF_TAKE(w->O, float, RD);    ATTNF_TAKE(w->OF, float, RD);
+    ATTNF_TAKE(w->K8, int8_t, TD);
 #undef ATTNF_TAKE
     ws = w;
     return ws;
@@ -105,7 +112,7 @@ static void attnf_q_prepare(attnf_ws * ws, const attnf_kv * kv, int R, const flo
         float * Qr = ws->Q + (size_t) r * ATTNF_DMAX;
         for (int d = 0; d < DK; ++d) Qr[d] = q[r][d] * scale;
         if (ulp) for (int d = 0; d < DK; d += 2) Qr[d] = nextafterf(Qr[d], INFINITY);
-        if (kv->type == GGML_TYPE_Q8_K) {
+        if (attnf_is_i8(kv->type)) {
             float amax = 0.0f;
             for (int d = 0; d < DK; ++d) amax = fmaxf(amax, fabsf(Qr[d]));
             const float dq = amax / 127.0f, iq = amax > 0.0f ? 127.0f / amax : 0.0f;
@@ -256,13 +263,68 @@ static inline void attnf_pv(attnf_ws * ws, int r0, int d0, int nt) {
 }
 #endif // ATTNF_SIMD
 
+// kv4/5/6 row (256 b-bit codes) -> 256 int8 levels; returns their sum
+#if ATTNF_SIMD && defined(__AVX512VBMI__)
+#define ATTNF_KVQ_SIMD 1
+struct attnf_kvq_tab {
+    __m512i perm, shift, mask, lut;
+    attnf_kvq_tab(int bits) {
+        alignas(64) uint8_t p[64], sh[64], l[64];
+        const int nl = 1 << (bits - 1);
+        const int8_t * lv = kvq_levels(bits);
+        for (int q = 0; q < 8; ++q) for (int k2 = 0; k2 < 8; ++k2) {
+            p[8 * q + k2]  = (uint8_t) (bits * q + (k2 < bits ? k2 : 0));   // the `bits` bytes that hold 8 codes -> one qword
+            sh[8 * q + k2] = (uint8_t) (k2 * bits);
+        }
+        for (int c = 0; c < 64; ++c) l[c] = (uint8_t) (c < nl ? lv[c] : c < 2 * nl ? -lv[c - nl] : 0);
+        perm = _mm512_load_si512(p); shift = _mm512_load_si512(sh); lut = _mm512_load_si512(l);
+        mask = _mm512_set1_epi8((char) ((1 << bits) - 1));
+    }
+};
+static inline const attnf_kvq_tab * attnf_kvq_tabs(int bits) {
+    static const attnf_kvq_tab t4(4), t5(5), t6(6);
+    return bits == 4 ? &t4 : bits == 5 ? &t5 : &t6;
+}
+static inline int32_t attnf_kvq_unpack(const uint8_t * qs, int bits, int8_t * out) {
+    const attnf_kvq_tab * tb = attnf_kvq_tabs(bits);
+    const int nb = 8 * bits;                               // bytes per 64 codes
+    const __mmask64 lm = (((__mmask64) 1) << nb) - 1;      // masked load: never reads past the row
+    const __m512i one = _mm512_set1_epi8(1);
+    __m512i sum = _mm512_setzero_si512();
+    for (int j = 0; j < 4; ++j) {
+        const __m512i v = _mm512_permutexvar_epi8(tb->perm, _mm512_maskz_loadu_epi8(lm, qs + nb * j));
+        const __m512i idx = _mm512_and_si512(_mm512_multishift_epi64_epi8(tb->shift, v), tb->mask);
+        const __m512i lv = _mm512_permutexvar_epi8(idx, tb->lut);
+        _mm512_storeu_si512(out + 64 * j, lv);
+        sum = _mm512_dpbusd_epi32(sum, one, lv);
+    }
+    return _mm512_reduce_add_epi32(sum);
+}
+#else
+#define ATTNF_KVQ_SIMD 0
+static inline int32_t attnf_kvq_unpack(const uint8_t * qs, int bits, int8_t * out) {
+    const int nl = 1 << (bits - 1);
+    const int8_t * lv = kvq_levels(bits);
+    int32_t s = 0;
+    for (int i = 0; i < 256; ++i) {
+        const int bit = i * bits, byte = bit >> 3, sh = bit & 7;
+        const uint32_t w = (uint32_t) qs[byte] | (byte + 1 < 32 * bits ? (uint32_t) qs[byte + 1] << 8 : 0u);
+        const int c = (int) ((w >> sh) & ((1u << bits) - 1));
+        out[i] = (int8_t) (c < nl ? lv[c] : -lv[c - nl]);
+        s += out[i];
+    }
+    return s;
+}
+#endif
+
 // Online softmax of the R prepared rows over keys [k0, k1): returns m[r], l[r] and the unnormalised O[r] (row stride
 // ldo floats). Tiles start at k0 and every ATTNF_T keys after it (callers keep k0 on the canonical grid).
 // pos[r] indexes mrow[] (several rows can share one mask row); mrow[i] = f16 mask indexed by absolute key, or NULL.
 static void attnf_range(attnf_ws * ws, const attnf_kv * kv, int R, const int * pos, int npos,
                         const ggml_fp16_t * const * mrow, int64_t k0, int64_t k1, float * m, float * l, float * O, size_t ldo) {
     const int DK = kv->dk, DV = kv->dv, T = ATTNF_T;
-    const bool i8 = kv->type == GGML_TYPE_Q8_K;
+    const bool i8 = attnf_is_i8(kv->type);
+    const int kqb = attnf_kvq_bits(kv->type);   // 0, or the bits of a kvq.h row
     for (int r = 0; r < R; ++r) { ws->m[r] = -INFINITY; ws->l[r] = 0.0f; memset(ws->O + (size_t) r * ATTNF_DMAX, 0, DV * sizeof(float)); }
     for (int64_t t0 = k0; t0 < k1; t0 += T) {
         const int nt = (int) (k1 - t0 < T ? k1 - t0 : T);
@@ -283,7 +345,7 @@ static void attnf_range(attnf_ws * ws, const attnf_kv * kv, int R, const int * p
 #if ATTNF_SIMD
         if (attnf_pf() && t0 + T < k1) {   // next tile's K and V rows into L2 (decode streams them from DRAM)
             const int64_t n2 = k1 - (t0 + T) < T ? k1 - (t0 + T) : T;
-            const size_t kb = i8 ? sizeof(attnf_q8k) * (DK / 256) : (size_t) DK * 2, vb = i8 ? sizeof(attnf_q8k) * (DV / 256) : (size_t) DV * 2;
+            const size_t kb = i8 ? attnf_blk(kv->type) * (DK / 256) : (size_t) DK * 2, vb = i8 ? attnf_blk(kv->type) * (DV / 256) : (size_t) DV * 2;
             for (int64_t t = 0; t < n2; ++t) {
                 const char * kr = kv->k + (t0 + T + t) * kv->nbk, * vr = kv->v + (t0 + T + t) * kv->nbv;
                 for (size_t o = 0; o < kb; o += 64) _mm_prefetch(kr + o, _MM_HINT_T1);
@@ -295,7 +357,12 @@ static void attnf_range(attnf_ws * ws, const attnf_kv * kv, int R, const int * p
         // K tile
         if (i8) {
             for (int t = 0; t < nt4; ++t) {
-                if (t < nt) {
+                if (t < nt && kqb) {
+                    const uint8_t * b = (const uint8_t *) (kv->k + (t0 + t) * kv->nbk);
+                    int8_t * k8 = ws->K8 + (size_t) t * ATTNF_DMAX;
+                    ws->kc[t] = 128 * attnf_kvq_unpack(b + 4, kqb, k8);
+                    ws->kq[t] = k8; memcpy(&ws->kd[t], b, 4);
+                } else if (t < nt) {
                     const attnf_q8k * b = (const attnf_q8k *) (kv->k + (t0 + t) * kv->nbk);
                     int32_t sk = 0;
                     for (int j = 0; j < DK / 16; ++j) sk += b[j / 16].bsums[j % 16];   // DK/256 blocks of 16 sums
@@ -389,7 +456,22 @@ static void attnf_range(attnf_ws * ws, const attnf_kv * kv, int R, const int * p
             ws->al[r] = a;
         }
         // V tile
-        if (i8) {
+        if (i8 && kqb) {
+            for (int t = 0; t < nt; ++t) {
+                const uint8_t * b = (const uint8_t *) (kv->v + (t0 + t) * kv->nbv);
+                float * vt = ws->Vt + (size_t) t * ATTNF_DMAX;
+                alignas(64) int8_t v8[256];
+                attnf_kvq_unpack(b + 4, kqb, v8);
+#if ATTNF_SIMD
+                for (int d = 0; d < 256; d += 16)
+                    _mm512_store_ps(vt + d, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_load_si128((const __m128i *) (v8 + d)))));
+#else
+                for (int d = 0; d < 256; ++d) vt[d] = (float) v8[d];
+#endif
+                memcpy(&ws->vd[t], b, 4);
+            }
+            for (int r = 0; r < R; ++r) { float * Sr = ws->S + (size_t) r * T; for (int t = 0; t < nt; ++t) Sr[t] *= ws->vd[t]; }
+        } else if (i8) {
             for (int t = 0; t < nt; ++t) {
                 const attnf_q8k * b = (const attnf_q8k *) (kv->v + (t0 + t) * kv->nbv);
                 float * vt = ws->Vt + (size_t) t * ATTNF_DMAX;
@@ -479,7 +561,7 @@ static void attnf_visible(const ggml_fp16_t * mr, int64_t nkv, int64_t * lo, int
 // returns true when the op was computed here
 static bool attnf_forward(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3], * sinks = dst->src[4];
-    const bool i8 = k->type == GGML_TYPE_Q8_K;
+    const bool i8 = attnf_is_i8(k->type);
     if (!i8 && (attnf_mode() == 0 || !ATTNF_SIMD)) return false;
     float scale = 1.0f, max_bias = 0.0f, softcap = 0.0f;
     memcpy(&scale,    (const float *) dst->op_params + 0, sizeof(float));
@@ -492,9 +574,10 @@ static bool attnf_forward(const struct ggml_compute_params * params, struct ggml
               v->ne[2] == HKV && HKV > 0 && NH % HKV == 0 && NH / HKV <= ATTNF_RMAX && q->nb[0] == sizeof(float) &&
               dst->nb[0] == sizeof(float) && dst->ne[0] == DV && dst->ne[1] == NH && dst->ne[2] == M &&
               (!mask || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1 && mask->ne[3] == 1 && mask->ne[0] >= NKV && mask->ne[1] >= M));
-    if (i8) ok = ok && DK % 256 == 0 && DV % 256 == 0 && ggml_type_size(GGML_TYPE_Q8_K) == sizeof(attnf_q8k);
+    if (i8) ok = ok && DK % 256 == 0 && DV % 256 == 0 && ggml_type_size(k->type) == attnf_blk(k->type);
+    if (attnf_kvq_bits(k->type)) ok = ok && DK == 256 && DV == 256 && ATTNF_SIMD;
     if (!ok) {
-        if (i8) GGML_ABORT("attn-fast: q8_K KV cache needs plain GQA attention (no sinks/alibi/softcap, head size multiple of 256)");
+        if (i8) GGML_ABORT("attn-fast: q8_K / kv4-6 KV cache needs plain GQA attention (no sinks/alibi/softcap, head size multiple of 256; kv4-6: head size 256, AVX-512)");
         return false;
     }
     const int ith = params->ith, nth = params->nth;
