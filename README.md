@@ -34,7 +34,8 @@ extraction, agents and speech then run locally with no per-token fee, and produc
 
 **It fits where a 27B model usually does not.** Everything here runs in 8 GB of system memory with no GPU at all: no
 video memory, no unified memory, nothing offloaded. A standard 4-bit build of the same Qwen3.8-27B is a 16–19 GB file,
-which is why models of this size are normally run on a GPU or a 24–32 GB machine. Mainline llama.cpp's own packing of
+which is why models of this size are normally run on a GPU or a 24–32 GB machine. (Another 26B model can be squeezed
+into 8 GB at 1 bit per weight; we measured it on the same box: [Numbers](#numbers).) Mainline llama.cpp's own packing of
 this ternary model is 7.63 GB and pages from disk on the same 8 GB machine ([measured](#numbers)); the file this engine
 runs is 5.95 GB.
 
@@ -166,6 +167,24 @@ does not fit comfortably in 8 GB:
 | its speculative decoding (`--spec-type draft-mtp`, 1.37 GB draft head) | 0.17 (76 % of drafts accepted; model + head exceed RAM) |
 
 With more memory it will do better; we have not measured that.
+
+**A different model in the same 8 GB: Inkling 2 Mini.** Thinking Machines' 26.4B model, in Unsloth's 1-bit GGUF
+(`UD-IQ1_S`, 7.76 GB) on Unsloth's llama.cpp build (`b12588`), CPU only, on the same 8 vCPU / 8 GB Ice Lake box, back to
+back with this engine (2026-11-21; one box, the 24 prompts above, 256 tokens, greedy). This compares two models as
+well as two engines:
+
+| same box, 24 prompts | decode tok/s, median [min–max] | GSM8K-40 | coding pass@1 (160 problems) | tokens per coding answer, median |
+|---|---|---|---|---|
+| **openset-llm `./serve`** | **20.07 [13.19–23.25]** | 39/40 | 83.1 % | 176 |
+| Inkling 2 Mini `UD-IQ1_S`, the fastest CPU setting we found | 7.40 [6.42–8.59] | 39/40 | 80.0 % | 1,054 |
+
+openset-llm decodes **2.8×** faster per prompt (2.80× [1.60–3.56]). Answer quality on these two small sets is level:
+the coding difference is not statistically significant (p = 0.38). Inkling always reasons before it answers (we found
+no way to switch that off), so its quality row is with its guide's sampling and a 3,072-token cap, one sample per
+problem, and it spends about six times the tokens per answer. Its fastest setting needs `-t 8 --cache-ram 0
+--ctx-checkpoints 1`; as its guide's command runs on a CPU it does 4.1 tok/s. The 1-bit file only just fits (it reads
+about 0.5 MB from disk per token); its larger files page on 8 GB (the recommended 4-bit file: 1.2 tok/s), and with
+enough memory for them it will do better: we have not measured that.
 
 <details><summary>Plain decoding and prompt reading, every engine without speculation (same boxes)</summary>
 
