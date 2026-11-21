@@ -1,0 +1,109 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 666c1576..b213e5ed 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1297,6 +1297,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     }
+ }
+ 
++#include "ptq1-fast.inc"
++
+ void ggml_compute_forward_mul_mat(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1304,6 +1306,10 @@ void ggml_compute_forward_mul_mat(
+     const struct ggml_tensor * src0 = dst->src[0];
+     const struct ggml_tensor * src1 = dst->src[1];
+ 
++    if (ptq1f_mul_mat(params, dst)) {
++        return;
++    }
++
+     const int32_t hint = ggml_get_op_params_i32(dst, 1);
+     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
+         ggml_compute_forward_fwht(params, dst);
+@@ -2914,6 +2920,9 @@ struct ggml_cplan ggml_graph_plan(
+                         if (node->src[1]->type != vec_dot_type) {
+                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                         }
++                        if (ptq1f_applies(node->src[0], node->src[1])) {
++                            cur = MAX(cur, ptq1f_wsize(node->src[0], node->src[1]));
++                        }
+                     } break;
+                 case GGML_OP_MUL_MAT_ID:
+                     {
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index ccb5ec86..c1e415f6 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2040,6 +2040,15 @@ static void ggml_compute_forward_concat_f16(
+     }
+ }
+ 
++static int ggml_rowsplit_on = -1;
++static bool ggml_rowsplit(void) {
++    if (ggml_rowsplit_on < 0) {
++        const char * e = getenv("GGML_ROWSPLIT");
++        ggml_rowsplit_on = e ? atoi(e) != 0 : 1;   // default on; GGML_ROWSPLIT=0 turns it off
++    }
++    return ggml_rowsplit_on > 0;
++}
++
+ static void ggml_compute_forward_concat_f32(
+     const ggml_compute_params * params,
+     ggml_tensor * dst) {
+@@ -2064,9 +2073,29 @@ static void ggml_compute_forward_concat_f32(
+     const float * x;
+ 
+     // TODO: smarter multi-theading
++    // GGML_ROWSPLIT: share (i2, i1) pairs across threads, so a dim-2 extent of 1 doesn't leave one thread copying
++    const bool rs = ggml_rowsplit();
++    if (rs && nb00 == sizeof(float) && nb10 == sizeof(float) && nb0 == sizeof(float)) {
++        // contiguous rows: copy whole row segments with memcpy, rows spread over all threads
++        int64_t r = 0;
++        for (int i3 = 0; i3 < ne3; i3++) for (int i2 = 0; i2 < ne2; i2++) for (int i1 = 0; i1 < ne1; i1++, r++) {
++            if (r % nth != ith) continue;
++            float * y = (float *)((char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3);
++            if (dim == 0) {
++                memcpy(y, (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03, ne00*sizeof(float));
++                memcpy(y + ne00, (const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13, ne10*sizeof(float));
++            } else if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
++                memcpy(y, (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03, ne0*sizeof(float));
++            } else {
++                memcpy(y, (const char *)src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13, ne0*sizeof(float));
++            }
++        }
++        return;
++    }
+     for (int i3 = 0; i3 < ne3; i3++) {
+-        for (int i2 = ith; i2 < ne2; i2 += nth) {
++        for (int i2 = rs ? 0 : ith; i2 < ne2; i2 += rs ? 1 : nth) {
+             for (int i1 = 0; i1 < ne1; i1++) {
++                if (rs && (i2*ne1 + i1) % nth != ith) continue;
+                 for (int i0 = 0; i0 < ne0; i0++) {
+                     if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                         x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
+@@ -4999,6 +5028,23 @@ static void ggml_compute_forward_get_rows_f32(
+     const int ith = params->ith;
+     const int nth = params->nth;
+ 
++    if (nr < nth && ggml_rowsplit()) {
++        // fewer rows than threads (e.g. one sequence's recurrent state): every thread copies a column slice
++        const int64_t dc = ((nc + nth - 1)/nth + 15)/16*16;
++        const int64_t c0 = MIN(dc*ith, nc), c1 = MIN(c0 + dc, nc);
++        for (int64_t i = 0; i < nr && c0 < c1; ++i) {
++            const int64_t i12 = i/(ne11*ne10);
++            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
++            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
++            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
++            GGML_ASSERT(i01 >= 0 && i01 < ne01);
++            ggml_vec_cpy_f32(c1 - c0,
++                    (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3) + c0,
++                    (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + c0);
++        }
++        return;
++    }
++
+     // rows per thread
+     const int dr = (nr + nth - 1)/nth;
+ 

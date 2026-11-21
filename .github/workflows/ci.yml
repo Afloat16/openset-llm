@@ -1,0 +1,21 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts parse
+        run: for f in install.sh serve start scripts/package.sh scripts/verify-dispatch.sh scripts/cross-aarch64.sh patches/apply.sh docker/entrypoint.sh bench/box.sh bench/jobs.sh; do bash -n "$f"; done
+      - name: Python compiles
+        run: python3 -m py_compile scripts/graft_mtp.py bench/*.py
+      - name: Files the README links to exist
+        run: |
+          fail=0
+          for f in $(grep -o -E '\]\(([A-Za-z0-9_./-]+)\)|(src|srcset)="[A-Za-z0-9_./-]+"' README.md | sed -E 's/^\]\(//; s/\)$//; s/^(src|srcset)="//; s/"$//' | sort -u); do
+            [ -e "$f" ] || { echo "README links to a missing file: $f"; fail=1; }
+          done
+          exit $fail

@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 344" width="860" height="344" role="img" aria-label="Generation speed, 27B model, one user, tokens per second. Ternary Bonsai-2-27B on an 8 vCPU / 8 GB Intel Ice Lake box, no GPU. Same model file, each engine in its fastest setting." font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<rect width="860" height="344" rx="10" fill="#1a1a19"/>
+<text x="24" y="34" font-size="17" font-weight="600" fill="#f0efec">Generation speed, 27B model, one user, tokens per second</text>
+<text x="24" y="56" font-size="12.5" fill="#c3c2b7">Ternary Bonsai-2-27B on an 8 vCPU / 8 GB Intel Ice Lake box, no GPU. Same model file, each engine in its fastest setting.</text>
+<line x1="250.0" y1="78" x2="250.0" y2="268" stroke="#383835" stroke-width="1"/>
+<text x="250.0" y="286" font-size="11.5" fill="#898781" text-anchor="middle">0</text>
+<line x1="354.5" y1="78" x2="354.5" y2="268" stroke="#2c2c2a" stroke-width="1"/>
+<text x="354.5" y="286" font-size="11.5" fill="#898781" text-anchor="middle">5</text>
+<line x1="459.1" y1="78" x2="459.1" y2="268" stroke="#2c2c2a" stroke-width="1"/>
+<text x="459.1" y="286" font-size="11.5" fill="#898781" text-anchor="middle">10</text>
+<line x1="563.6" y1="78" x2="563.6" y2="268" stroke="#2c2c2a" stroke-width="1"/>
+<text x="563.6" y="286" font-size="11.5" fill="#898781" text-anchor="middle">15</text>
+<line x1="668.2" y1="78" x2="668.2" y2="268" stroke="#2c2c2a" stroke-width="1"/>
+<text x="668.2" y="286" font-size="11.5" fill="#898781" text-anchor="middle">20 tok/s</text>
+<text x="236" y="104.0" font-size="13.5" font-weight="600" fill="#f0efec" text-anchor="end">this engine</text>
+<text x="236" y="120.0" font-size="11" fill="#898781" text-anchor="end">./serve (default)</text>
+<path d="M250.0,95.0 h407.9 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-407.9 z" fill="#184f95"/>
+<path d="M250.0,95.0 h351.5 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-351.5 z" fill="#3987e5"/>
+<text x="669.9" y="111.5" font-size="13.5" font-weight="600" fill="#f0efec">17–19.7 tok/s</text>
+<text x="236" y="150.0" font-size="13.5" font-weight="600" fill="#f0efec" text-anchor="end">this engine, plain decoding</text>
+<text x="236" y="166.0" font-size="11" fill="#898781" text-anchor="end">./serve --no-spec</text>
+<path d="M250.0,141.0 h205.1 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-205.1 z" fill="#184f95"/>
+<path d="M250.0,141.0 h184.2 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-184.2 z" fill="#3987e5"/>
+<text x="467.1" y="157.5" font-size="13.5" font-weight="600" fill="#f0efec">9–10 tok/s</text>
+<text x="236" y="196.0" font-size="13.5" font-weight="400" fill="#f0efec" text-anchor="end">ik_llama.cpp</text>
+<text x="236" y="212.0" font-size="11" fill="#898781" text-anchor="end">-rtr</text>
+<path d="M250.0,187.0 h92.2 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-92.2 z" fill="#4a4a46"/>
+<path d="M250.0,187.0 h79.6 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-79.6 z" fill="#6f6e68"/>
+<text x="354.2" y="203.5" font-size="13.5" font-weight="400" fill="#f0efec">4–4.6 tok/s</text>
+<text x="236" y="249.0" font-size="13.5" font-weight="400" fill="#f0efec" text-anchor="end">PrismML llama.cpp fork</text>
+<path d="M250.0,233.0 h62.9 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-62.9 z" fill="#4a4a46"/>
+<path d="M250.0,233.0 h52.5 a4,4 0 0 1 4,4 v16 a4,4 0 0 1 -4,4 h-52.5 z" fill="#6f6e68"/>
+<text x="324.9" y="249.5" font-size="13.5" font-weight="400" fill="#f0efec">2.7–3.2 tok/s</text>
+<text x="24" y="328" font-size="11.5" fill="#898781">Solid bar: the lower of two benchmark runs on different boxes (48 prompt runs each). Lighter part: up to the higher run.</text>
+</svg>

@@ -1,0 +1,504 @@
+diff --git a/common/common.h b/common/common.h
+index 0ab2a3f..ac41469 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1151,6 +1151,9 @@ struct common_prompt_checkpoint {
+     // (optional) id of the task that created the checkpoint
+     int id_task = -1;
+ 
++    // (optional) why it was made (server resume pool, 0007): 0 = other
++    int kind = 0;
++
+     llama_pos pos_min;
+     llama_pos pos_max;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index ee2de80..40e52f2 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -43,6 +43,149 @@ extern "C" int  llama_x1_draft_list_ready(void);
+ extern "C" int  llama_x1_draft_list_has(int32_t t);
+ extern "C" void llama_x1_draft_set_full(int full);
+ 
++// ---- openset-llm 0007 resume: checkpoint where the next request will resume -------------------------------------------
++// LLAMA_RESUME=0 turns all of it off (the server then behaves exactly as with 0006 alone).
++//  (a) when a request diverges from the cached tokens inside the previous prompt (a client that rewrites its tail,
++//      e.g. a <system-reminder> it strips and re-appends), the RSM_SIG_LEN tokens the old prompt had at the
++//      divergence are remembered. While reading later prompts the batch is cut at the last occurrence of each such
++//      signature and a checkpoint is made there, so the next request resumes at its divergence, not a message earlier.
++//  (b) the --ctx-checkpoints N pool is cost-aware: a checkpoint is worth (prompt tokens it saves) x (observed resume
++//      rate of its kind); when the pool is full the least valuable one goes, and a new one worth less than all kept
++//      ones is not made. Same bytes per checkpoint, so this is FlashState's "prefill saved per byte".
++//  (c) LLAMA_RESUME_DIR=<dir>: the full state (attention KV + recurrent + draft) at the end of the system(+tools)
++//      prefix is written once per distinct prefix (token hash) and loaded by any request whose cache does not cover it
++//      (a new conversation, another slot's conversation, a restarted server). LLAMA_RESUME_DIR_MAX files (default 8).
++#include <fcntl.h>
++#if defined(__linux__) || defined(__APPLE__)
++#include <unistd.h>
++#endif
++
++enum rsm_kind { RSM_OTHER = 0, RSM_USER, RSM_END_UB, RSM_END4, RSM_SIG, RSM_N_KINDS };
++static const char * rsm_kind_name(int k) {
++    static const char * n[] = { "other", "msg-start", "end-ub", "end-4", "signature" };
++    return k >= 0 && k < RSM_N_KINDS ? n[k] : "?";
++}
++static constexpr int RSM_SIG_LEN  = 4;
++static constexpr int RSM_MAX_SIGS = 4;
++struct rsm_sig { llama_tokens toks; int64_t used = 0; };
++static struct {
++    int on = -1;
++    std::string dir;
++    int max_files = 8;
++    std::vector<rsm_sig> sigs;
++    int64_t clock = 0;
++    double hits[RSM_N_KINDS]  = { 0 };
++    double tries[RSM_N_KINDS] = { 0 };
++} rsm;
++static bool rsm_on() {
++    if (rsm.on < 0) {
++        const char * e = getenv("LLAMA_RESUME");
++        rsm.on = !(e && atoi(e) == 0);
++        const char * d = getenv("LLAMA_RESUME_DIR");
++        if (rsm.on && d && *d) {
++            std::error_code ec;
++            std::filesystem::create_directories(d, ec);
++            if (!ec) { rsm.dir = d; }
++        }
++        const char * m = getenv("LLAMA_RESUME_DIR_MAX");
++        if (m) { rsm.max_files = std::max(1, atoi(m)); }
++    }
++    return rsm.on == 1;
++}
++// resume rate of a kind: observed (hits, tries) plus a prior worth 2 tries
++static double rsm_rate(int k) {
++    static const double prior[RSM_N_KINDS] = { 0.2, 0.5, 0.3, 0.5, 0.9 };
++    return (rsm.hits[k] + 2.0 * prior[k]) / (rsm.tries[k] + 2.0);
++}
++static double rsm_value(int kind, int64_t n_tokens) { return rsm_rate(kind) * (double) n_tokens; }
++static uint64_t rsm_env_hash = 0;   // the environment key below, set once at the first prefix lookup
++static uint64_t rsm_hash(const llama_tokens & t) {
++    uint64_t h = 1469598103934665603ULL;
++    for (llama_token x : t) { h ^= (uint32_t) x; h *= 1099511628211ULL; }
++    return (h ^ (uint64_t) t.size()) * 31 + rsm_env_hash;   // the file name keys the tokens AND the environment
++}
++// what else a saved state depends on: the model file (path, size, FNV of its first MiB), this binary (size + mtime of
++// /proc/self/exe: any patch or kernel change rebuilds it), KV types, flash-attention mode, whether a draft context
++// exists, and every GGML_* / LLAMA_* / X1_* environment variable (kernel modes, X1/X2 switches), LLAMA_RESUME* excepted
++static uint64_t rsm_fnv(uint64_t h, const void * p, size_t n) {
++    const uint8_t * b = (const uint8_t *) p;
++    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ULL; }
++    return h;
++}
++#if !defined(_WIN32)
++extern char ** environ;
++#endif
++static std::string rsm_env_desc(const std::string & model_path, int type_k, int type_v, int fa, bool has_dft) {
++    std::error_code ec;
++    std::string d = "model=" + model_path + " size=" + std::to_string((unsigned long long) std::filesystem::file_size(model_path, ec));
++    {
++        std::ifstream f(model_path, std::ios::binary);
++        std::vector<char> head(1 << 20);
++        f.read(head.data(), head.size());
++        char b[32];
++        snprintf(b, sizeof(b), "%016llx", (unsigned long long) rsm_fnv(1469598103934665603ULL, head.data(), (size_t) f.gcount()));
++        d += std::string(" head=") + b;
++    }
++#if defined(__linux__)
++    {
++        const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
++        const auto sz  = std::filesystem::file_size(exe, ec);
++        const auto mt  = std::filesystem::last_write_time(exe, ec).time_since_epoch().count();
++        d += " exe=" + std::to_string((unsigned long long) sz) + "@" + std::to_string((long long) mt);
++    }
++#endif
++    d += " ctk=" + std::to_string(type_k) + " ctv=" + std::to_string(type_v) + " fa=" + std::to_string(fa) + " dft=" + std::to_string(has_dft ? 1 : 0);
++    std::vector<std::string> env;
++#if !defined(_WIN32)
++    for (char ** e = environ; e && *e; e++) {
++        const std::string kv = *e;
++        if ((kv.rfind("GGML_", 0) == 0 || kv.rfind("LLAMA_", 0) == 0 || kv.rfind("X1_", 0) == 0) && kv.rfind("LLAMA_RESUME", 0) != 0) {
++            env.push_back(kv);
++        }
++    }
++#endif
++    std::sort(env.begin(), env.end());
++    for (const auto & kv : env) { d += " " + kv; }
++    return d;
++}
++static std::string rsm_path(uint64_t h, const char * part) {
++    char b[64];
++    snprintf(b, sizeof(b), "/prefix-%016llx.%s", (unsigned long long) h, part);
++    return rsm.dir + b;
++}
++// a state written on an 8 GB box must not stay in the page cache (it would push out the model's hot file pages)
++static void rsm_drop_cache(const std::string & path) {
++#if defined(__linux__)
++    int fd = open(path.c_str(), O_RDONLY);
++    if (fd >= 0) { fdatasync(fd); posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); close(fd); }
++#else
++    (void) path;
++#endif
++}
++static void rsm_prune() {
++    std::error_code ec;
++    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> v;
++    for (const auto & e : std::filesystem::directory_iterator(rsm.dir, ec)) {
++        const auto name = e.path().filename().string();
++        if (name.rfind("prefix-", 0) == 0 && e.path().extension() == ".tgt") {
++            v.emplace_back(std::filesystem::last_write_time(e.path(), ec), e.path());
++        }
++    }
++    if ((int) v.size() <= rsm.max_files) { return; }
++    std::sort(v.begin(), v.end());
++    for (size_t i = 0; i + rsm.max_files < v.size(); i++) {
++        auto p = v[i].second;
++        for (const char * ext : { ".tgt", ".dft", ".spec" }) { p.replace_extension(ext); std::filesystem::remove(p, ec); }
++    }
++}
++static bool rsm_read_bytes(const std::string & path, std::vector<uint8_t> & out) {
++    std::ifstream f(path, std::ios::binary);
++    if (!f) { return false; }
++    out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
++    return true;
++}
++// ------------------------------------------------------------------------------------------------------------------
++
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+@@ -305,6 +448,14 @@ struct server_slot {
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
+ 
++    // 0007 resume: predicted resume points of the current prompt, the previous prompt's length, the prefix to save
++    std::vector<int32_t> rsm_points;
++    int32_t rsm_prev_n_prompt = 0;
++    int32_t rsm_prefix = -1;
++    bool rsm_is_point(int32_t pos) const {
++        return std::binary_search(rsm_points.begin(), rsm_points.end(), pos);
++    }
++
+     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
+     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
+     std::unique_ptr<const server_task> task;
+@@ -2341,7 +2492,7 @@ private:
+     }
+ 
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
+-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
++    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, int kind = 0) {
+         const int id_task = slot.task->id;
+ 
+         // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
+@@ -2352,6 +2503,28 @@ private:
+             spare_dft = std::move(ckpt.data_dft);
+         };
+ 
++        if (rsm_on()) {
++            // 0007: cost-aware pool instead of min-step thinning + FIFO
++            const int64_t n_new = slot.prompt.n_tokens() - n_tokens_cur;
++            const double  v_new = rsm_value(kind, n_new);
++            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
++                if (it->n_tokens == n_new) { keep_spare(*it); it = slot.prompt.checkpoints.erase(it); } else { ++it; }
++            }
++            while (!slot.prompt.checkpoints.empty() && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
++                auto victim = std::min_element(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
++                        [](const auto & a, const auto & b) { return rsm_value(a.kind, a.n_tokens) < rsm_value(b.kind, b.n_tokens); });
++                const double v_old = rsm_value(victim->kind, victim->n_tokens);
++                if (v_old > v_new) {
++                    SLT_INF(slot, "resume: not keeping a %s state at %" PRId64 " (worth %.0f < %.0f of the %s state at %" PRId64 ")\n",
++                            rsm_kind_name(kind), n_new, v_new, v_old, rsm_kind_name(victim->kind), victim->n_tokens);
++                    return;
++                }
++                SLT_INF(slot, "resume: replacing the %s state at %" PRId64 " (worth %.0f) by a %s state at %" PRId64 " (worth %.0f)\n",
++                        rsm_kind_name(victim->kind), victim->n_tokens, v_old, rsm_kind_name(kind), n_new, v_new);
++                keep_spare(*victim);
++                slot.prompt.checkpoints.erase(victim);
++            }
++        } else {
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+         int64_t last = -1;
+@@ -2379,10 +2552,12 @@ private:
+             keep_spare(cur);
+             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+         }
++        } // !rsm_on()
+ 
+         auto & cur = slot.prompt.checkpoints.emplace_back();
+ 
+         cur.id_task = id_task;
++        cur.kind    = kind;
+ 
+         cur.data_tgt = std::move(spare_tgt);
+         cur.data_dft = std::move(spare_dft);
+@@ -2403,6 +2578,164 @@ private:
+                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+     }
+ 
++    // 0007: called when a completion task starts, after n_past (the common prefix with the cache) is known
++    void rsm_task_start(server_slot & slot, int32_t & n_past) {
++        const auto & in = slot.task->tokens;
++        const int32_t n_old = slot.prompt.n_tokens();
++        const int32_t n_new = slot.task->n_tokens();
++
++        // (a) learn: the request diverged from the cache inside the previous prompt -> remember the old tokens there
++        if (slot.task->params.cache_prompt && n_past > 0 && n_past < slot.rsm_prev_n_prompt && n_past + 1 + RSM_SIG_LEN <= n_old) {
++            // the token at the divergence often merges with the whitespace before it (' \\n\\n', '\\t\\n\\n', ...), so the
++            // signature is the RSM_SIG_LEN tokens after it, and the resume point is the token before a match
++            llama_tokens sig;
++            for (int i = 1; i <= RSM_SIG_LEN; i++) { sig.push_back(slot.prompt.tokens[n_past + i]); }
++            if (std::none_of(sig.begin(), sig.end(), [](llama_token t) { return t == LLAMA_TOKEN_NULL; })) {
++                auto it = std::find_if(rsm.sigs.begin(), rsm.sigs.end(), [&](const rsm_sig & s) { return s.toks == sig; });
++                const bool fresh = it == rsm.sigs.end();
++                if (fresh) {
++                    if ((int) rsm.sigs.size() >= RSM_MAX_SIGS) {
++                        rsm.sigs.erase(std::min_element(rsm.sigs.begin(), rsm.sigs.end(),
++                                [](const rsm_sig & a, const rsm_sig & b) { return a.used < b.used; }));
++                    }
++                    rsm.sigs.push_back({ sig, ++rsm.clock });
++                } else {
++                    it->used = ++rsm.clock;
++                }
++                std::string txt;
++                txt = "[" + common_token_to_piece(ctx_tgt, slot.prompt.tokens[n_past]) + "]";
++                for (llama_token t : sig) { txt += common_token_to_piece(ctx_tgt, t); }
++                string_replace_all(txt, "\n", "\\n");
++                SLT_INF(slot, "resume: diverged at %d of %d cached tokens (previous prompt %d), %s signature '%s'\n",
++                        n_past, n_old, slot.rsm_prev_n_prompt, fresh ? "learned" : "seen", txt.c_str());
++            }
++        }
++
++        // (b) predicted resume points: the last occurrence of each signature in the part still to be read
++        slot.rsm_points.clear();
++        for (const auto & s : rsm.sigs) {
++            for (int32_t q = n_new - RSM_SIG_LEN - 1; q - 1 > n_past; q--) {
++                bool m = true;
++                for (int i = 0; i < RSM_SIG_LEN && m; i++) { m = in[q + i] == s.toks[i]; }
++                if (m) { slot.rsm_points.push_back(q - 1); break; }
++            }
++        }
++        std::sort(slot.rsm_points.begin(), slot.rsm_points.end());
++        slot.rsm_points.erase(std::unique(slot.rsm_points.begin(), slot.rsm_points.end()), slot.rsm_points.end());
++        if (!slot.rsm_points.empty()) {
++            std::string pts;
++            for (auto q : slot.rsm_points) { pts += " " + std::to_string(q); }
++            SLT_INF(slot, "resume: predicted resume points:%s (prompt %d, cached %d)\n", pts.c_str(), n_new, n_past);
++        }
++
++        // (c) the system(+tools) prefix on disk
++        slot.rsm_prefix = -1;
++        rsm_load_prefix(slot, n_past);
++    }
++
++    // 0007 (c): load the prefix state if the cache does not cover it (or mark it to be written when the prefill gets
++    // there). Also called when no checkpoint is usable (the prompt would otherwise be read from token 0).
++    bool rsm_load_prefix(server_slot & slot, int32_t & n_past) {
++        const auto & in = slot.task->tokens;
++        const int32_t n_new = slot.task->n_tokens();
++        if (rsm.dir.empty()) {
++            return false;
++        }
++        if (rsm_env_hash == 0) {
++            const std::string d = rsm_env_desc(params_base.model.path, (int) params_base.cache_type_k, (int) params_base.cache_type_v,
++                    (int) params_base.flash_attn_type, ctx_dft != nullptr);
++            rsm_env_hash = rsm_fnv(1469598103934665603ULL, d.data(), d.size()) | 1;
++            SRV_INF("resume: prefix states in %s, environment key %016llx (%s)\n", rsm.dir.c_str(), (unsigned long long) rsm_env_hash, d.c_str());
++        }
++        int32_t p = -1;
++        for (const auto & sp : slot.task->params.message_spans.spans) {
++            if (sp.role != COMMON_CHAT_ROLE_SYSTEM && sp.role != COMMON_CHAT_ROLE_UNKNOWN) { p = (int32_t) sp.pos; break; }
++        }
++        if (p < 64 || p >= n_new || n_past >= p) {
++            return false;
++        }
++        llama_tokens pre(in.get_tokens().begin(), in.get_tokens().begin() + p);
++        if (std::find(pre.begin(), pre.end(), LLAMA_TOKEN_NULL) != pre.end()) {
++            return false;
++        }
++        const uint64_t h = rsm_hash(pre);
++        const std::string ft = rsm_path(h, "tgt");
++        std::error_code ec;
++        if (!std::filesystem::exists(ft, ec)) {
++            slot.rsm_prefix = p;   // write it when the prefill reaches p
++            return false;
++        }
++        const int64_t t0 = ggml_time_us();
++        slot.mem.seq_rm(slot.id, -1, -1);
++        llama_tokens got(p);
++        size_t n_got = 0;
++        bool ok = llama_state_seq_load_file(ctx_tgt, ft.c_str(), slot.id, got.data(), got.size(), &n_got) > 0 && n_got == (size_t) p && got == pre;
++        if (ok && ctx_dft) {
++            size_t n_d = 0;
++            ok = llama_state_seq_load_file(ctx_dft, rsm_path(h, "dft").c_str(), slot.id, got.data(), got.size(), &n_d) > 0 && n_d == (size_t) p;
++        }
++        if (ok) {
++            std::vector<uint8_t> sp;
++            if (rsm_read_bytes(rsm_path(h, "spec"), sp) && !sp.empty()) {
++                common_speculative_set_state(spec.get(), slot.id, sp);
++            }
++            rsm_drop_cache(ft);
++            std::filesystem::last_write_time(ft, std::filesystem::file_time_type::clock::now(), ec);
++        }
++        if (!ok) {
++            SLT_WRN(slot, "resume: could not load the prefix state %s (removed; it is written again); reading the prompt from token 0\n", ft.c_str());
++            for (const char * ext : { "tgt", "dft", "spec" }) { std::filesystem::remove(rsm_path(h, ext), ec); }
++            slot.mem.seq_rm(slot.id, -1, -1);
++            slot.prompt.clear();
++            slot.rsm_prefix = p;
++            n_past = 0;
++            return false;
++        }
++        slot.prompt.clear();   // the cache now holds exactly the prefix; old checkpoints belonged to another conversation
++        for (llama_token t : pre) { slot.prompt.tokens.push_back(t); }
++        n_past = p;
++        SLT_INF(slot, "resume: loaded the %d-token prefix state from %s in %.2f s\n", p, ft.c_str(), (ggml_time_us() - t0) / 1e6);
++        return true;
++    }
++
++    // 0007: write the prefix state; called when the prefill stands exactly at the prefix end
++    void rsm_save_prefix(server_slot & slot) {
++        const int32_t p = slot.rsm_prefix;
++        slot.rsm_prefix = -1;
++        const auto & in = slot.task->tokens;
++        llama_tokens pre(in.get_tokens().begin(), in.get_tokens().begin() + p);
++        const uint64_t h = rsm_hash(pre);
++        const int64_t t0 = ggml_time_us();
++        size_t bytes = 0;
++        bool ok = true;
++        std::error_code ec;
++        const std::string ft = rsm_path(h, "tgt");
++        const std::string tmp_t = ft + ".tmp";
++        bytes += llama_state_seq_save_file(ctx_tgt, tmp_t.c_str(), slot.id, pre.data(), pre.size());
++        rsm_drop_cache(tmp_t);
++        if (ctx_dft) {
++            const std::string fd = rsm_path(h, "dft");
++            bytes += llama_state_seq_save_file(ctx_dft, fd.c_str(), slot.id, pre.data(), pre.size());
++            rsm_drop_cache(fd);
++        }
++        std::vector<uint8_t> sp;
++        if (common_speculative_get_state(spec.get(), slot.id, sp)) {
++            std::ofstream f(rsm_path(h, "spec"), std::ios::binary);
++            f.write((const char *) sp.data(), sp.size());
++            ok = (bool) f;
++            bytes += sp.size();
++        } else {
++            std::filesystem::remove(rsm_path(h, "spec"), ec);
++        }
++        if (ok) {
++            std::filesystem::rename(tmp_t, ft, ec);   // the .tgt file appears last: it marks a complete set
++            ok = !ec;
++        }
++        SLT_INF(slot, "resume: %s the %d-token prefix state (%.1f MiB) in %.2f s\n", ok ? "wrote" : "FAILED to write", p,
++                bytes / 1024.0 / 1024.0, (ggml_time_us() - t0) / 1e6);
++        rsm_prune();
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+@@ -3358,6 +3691,10 @@ private:
+                                 n_past = 0;
+                             }
+ 
++                            if (rsm_on() && params_base.n_ctx_checkpoints > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
++                                rsm_task_start(slot, n_past);
++                            }
++
+                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+ 
+                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
+@@ -3443,6 +3780,11 @@ private:
+ 
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
++                                        if (rsm_on()) {
++                                            rsm.hits[it->kind] += 1; rsm.tries[it->kind] += 1;
++                                            SLT_INF(slot, "resume: restored the %s state at %" PRId64 " (common prefix %d; resume rate of its kind now %.2f)\n",
++                                                    rsm_kind_name(it->kind), it->n_tokens, (int) pos_next, rsm_rate(it->kind));
++                                        }
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                     }
+ 
+@@ -3451,6 +3793,13 @@ private:
+                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                         pos_next = 0;
+                                         n_past = 0;
++                                        if (rsm_on() && params_base.n_ctx_checkpoints > 0 && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
++                                            int32_t np = 0;
++                                            if (rsm_load_prefix(slot, np)) {   // the cache is now exactly the prefix
++                                                n_past   = np;
++                                                pos_next = slot.prompt.tokens.pos_next(n_past);
++                                            }
++                                        }
+                                     }
+                                 }
+                             }
+@@ -3460,6 +3809,7 @@ private:
+                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                     const auto & cur = *it;
+                                     if (cur.pos_max > pos_next) {
++                                        if (rsm_on()) { rsm.tries[cur.kind] += 1; }
+                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                         it = slot.prompt.checkpoints.erase(it);
+                                     } else {
+@@ -3635,6 +3985,11 @@ private:
+                             }
+                         }
+ 
++                        // 0007: cut at a predicted resume point, and at the end of a prefix whose state goes to disk
++                        if (do_checkpoint && rsm_on() && (slot.rsm_is_point(slot.prompt.n_tokens()) || slot.prompt.n_tokens() == slot.rsm_prefix)) {
++                            break;
++                        }
++
+                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
+                         // create checkpoints that many tokens before the end of the prompt:
+                         //  - 4 + n_ubatch
+@@ -3666,6 +4021,10 @@ private:
+ 
+                     const bool is_user_start = spans.is_user_start(n_tokens_start);
+                     const bool is_last_user_message = n_tokens_start == last_user_pos;
++                    const bool rsm_point = do_checkpoint && rsm_on() && slot.rsm_is_point(n_tokens_start);
++                    if (do_checkpoint && rsm_on() && n_tokens_start == slot.rsm_prefix && !has_mtmd) {
++                        rsm_save_prefix(slot);
++                    }
+ 
+                     // entire prompt has been processed
+                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+@@ -3678,12 +4037,13 @@ private:
+ 
+                         slot.stats.n_gen = 0;
+                         slot.i_batch     = batch.size() - 1;
++                        slot.rsm_prev_n_prompt = slot.task->n_tokens();
+ 
+                         slot.init_sampler();
+                     } else {
+                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
+                         // message or we are near the end of the prompt
+-                        if (!is_user_start && !near_prompt_end) {
++                        if (!is_user_start && !near_prompt_end && !rsm_point) {
+                             do_checkpoint = false;
+                         }
+                     }
+@@ -3703,14 +4063,19 @@ private:
+                     // no need to create checkpoints that are too close together, unless it's the last user message
+                     do_checkpoint = do_checkpoint && (
+                             slot.prompt.checkpoints.empty() ||
+-                            is_last_user_message || near_prompt_end ||
++                            is_last_user_message || near_prompt_end || rsm_point || (rsm_on() && is_user_start) ||
+                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
+ 
+                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                     //       yet processed and therefore it is not part of the checkpoint.
+                     if (do_checkpoint) {
+-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
++                        int kind = RSM_OTHER;
++                        if (rsm_on()) {
++                            const int64_t d = slot.task->n_tokens() - n_tokens_start;
++                            kind = rsm_point ? RSM_SIG : is_user_start ? RSM_USER : d <= 4 ? RSM_END4 : near_prompt_end || d <= 4 + n_ubatch ? RSM_END_UB : RSM_OTHER;
++                        }
++                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, kind);
+                     }
+                 }
+ 

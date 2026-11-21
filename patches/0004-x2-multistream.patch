@@ -1,0 +1,712 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 64f68138..da2575cd 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3135,8 +3135,246 @@ static int ggml_cpu_try_fuse_ops(
+ }
+ 
+ int ggml_k6_node(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params);   // K6 (ops.cpp)
++int ggml_x2_node(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params);   // X2 (ops.cpp)
+ int ggml_x1_node(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params);   // X1 (ops.cpp), falls through to K6
+ 
++// X2 bit 32: the multi-stream decode's ternary matmuls (M = 2..4 activation columns, one per
++// sequence) through TWO panels per core at once -- K5's two-stream trick (ptq1v_panel_np) applied to ptq1v_panel's
++// NT-token loop. At M = 4 a 512-byte unit costs ~171 port-0 uops (38 vpdpbusd + flushes per token), about the same time
++// as streaming it from DRAM, so the decode window holds few lines in flight; a second panel doubles them.
++// Numerics: per (panel, token) the int32 block sums are exact whatever the chain count, and every block's
++// fmadd(cvt(sum), dxv * dy) into the float accumulator runs in block order from 0 with the same operands as
++// ptq1v_panel, so each column is bit-identical to ptq1v_gemm_m and to the M = 1 kernels.
++// Included into ggml-cpu.c after ptq1-fast.inc by apply_x2.py (needs PTQ1V_OK).
++#if defined(PTQ1V_OK) && PTQ1V_OK
++#ifndef X2_PF
++#define X2_PF 2048
++#endif
++static inline __attribute__((always_inline)) void x2_panel2_nt(
++        const ptq1p_entry * e, const uint8_t * panel, const uint8_t * acts, size_t cb, const int NT, const int PF,
++        float * dst, int64_t ld, int64_t row0) {
++    enum { NP = 2 };
++    const int64_t kpad = e->kpad;
++    const int8_t * q[4]; const float * dy[4]; const int32_t * as[4];
++    for (int t = 0; t < NT; ++t) {
++        const uint8_t * base = acts + (size_t) t * cb;
++        q[t] = (const int8_t *) base; dy[t] = (const float *) (base + kpad); as[t] = (const int32_t *) (dy[t] + kpad / 32);
++    }
++    const ggml_half * sc[NP]; const uint8_t * P[NP];
++    for (int p = 0; p < NP; ++p) { P[p] = panel + p * e->panel_stride; sc[p] = (const ggml_half *) (P[p] + ptq1v_data_bytes(e)); }
++    const __m512i ctrlA = _mm512_load_si512(ptq1v_tab[0]), ctrlC = _mm512_load_si512(ptq1v_tab[1]), ctrlD = _mm512_load_si512(ptq1v_tab[2]);
++    const __m512i l30 = _mm512_load_si512(ptq1v_tab[3]), l31 = _mm512_load_si512(ptq1v_tab[4]), l32 = _mm512_load_si512(ptq1v_tab[5]);
++    const __m512i l20 = _mm512_load_si512(ptq1v_tab[6]), l21 = _mm512_load_si512(ptq1v_tab[7]);
++    const __m512i g0 = _mm512_load_si512(ptq1v_tab[8]), gC = _mm512_load_si512(ptq1v_tab[9]), gD = _mm512_load_si512(ptq1v_tab[10]);
++    __m512 accf[NP][4], dxv[NP]; __m512i acci[NP][4];
++    for (int p = 0; p < NP; ++p) {
++        dxv[p] = _mm512_setzero_ps();
++        for (int t = 0; t < NT; ++t) { accf[p][t] = _mm512_setzero_ps(); acci[p][t] = _mm512_set1_epi32(as[t][0]); }
++    }
++    int64_t b0 = 0, s0 = 0;
++#define X2_STEP(s, CODES) do {                                                                                \
++        const __m512i c0_ = CODES(0), c1_ = CODES(1);                                                         \
++        for (int t = 0; t < NT; ++t) {                                                                        \
++            const __m512i bq_ = _mm512_set1_epi32(*(const int32_t *) (q[t] + 4 * (s0 + (s))));                \
++            acci[0][t] = _mm512_dpbusd_epi32(acci[0][t], c0_, bq_);                                           \
++            acci[1][t] = _mm512_dpbusd_epi32(acci[1][t], c1_, bq_);                                           \
++        }                                                                                                     \
++        if ((s) % 8 == 7) {                                                                                   \
++            const int64_t b = b0 + (s) / 8;                                                                   \
++            for (int p = 0; p < NP; ++p) {                                                                    \
++                if ((b & 3) == 0) dxv[p] = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (sc[p] + (b >> 2) * PTQ1P_ROWS))); \
++                for (int t = 0; t < NT; ++t) {                                                                \
++                    accf[p][t] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acci[p][t]), _mm512_mul_ps(dxv[p], _mm512_set1_ps(dy[t][b])), accf[p][t]); \
++                    acci[p][t] = _mm512_set1_epi32(as[t][b + 1]);                                             \
++                }                                                                                             \
++            }                                                                                                 \
++        } } while (0)
++#define X2_A(p) _mm512_permutexvar_epi8(A[p], L)
++#define X2_B(p) _mm512_permutexvar_epi8(B[p], L)
++#define X2_E(p) _mm512_permutexvar_epi8(E[p], L)
++#define X2_T(p) _mm512_permutexvar_epi8(T[p], L)
++#define X2_PAIR(off, sl, pp, TAIL) do {                                                                       \
++        __m512i A[NP], B[NP], E[NP];                                                                          \
++        for (int p = 0; p < NP; ++p) {                                                                        \
++            if (PF) { _mm_prefetch((const char *) (P[p] + (off) + PF), _MM_HINT_T0); _mm_prefetch((const char *) (P[p] + (off) + PF + 64), _MM_HINT_T0); } \
++            const __m512i c0 = _mm512_loadu_si512((const void *) (P[p] + (off)));                             \
++            const __m512i c1 = _mm512_loadu_si512((const void *) (P[p] + (off) + 64));                        \
++            A[p] = _mm512_multishift_epi64_epi8(ctrlA, c0); B[p] = _mm512_multishift_epi64_epi8(ctrlA, c1);   \
++            const __m512i C = _mm512_multishift_epi64_epi8(ctrlC, c0), D = _mm512_multishift_epi64_epi8(ctrlD, c1); \
++            E[p] = _mm512_mask_blend_epi32((__mmask16) 0xAAAA, C, D);                                         \
++            if (TAIL) {                                                                                       \
++                if ((pp) == 0) T[p] = _mm512_permutex2var_epi8(C, g0, D);                                     \
++                else {                                                                                        \
++                    T[p] = _mm512_mask_permutex2var_epi8(T[p], (__mmask64) 0xFFu << (16 * (pp)), gC, C);      \
++                    T[p] = _mm512_mask_permutex2var_epi8(T[p], (__mmask64) 0xFFu << (16 * (pp) + 8), gD, D);  \
++                }                                                                                             \
++            }                                                                                                 \
++        }                                                                                                     \
++        { const __m512i L = l30; X2_STEP((sl) + 0, X2_A); }                                                   \
++        { const __m512i L = l31; X2_STEP((sl) + 1, X2_A); }                                                   \
++        { const __m512i L = l32; X2_STEP((sl) + 2, X2_A); }                                                   \
++        { const __m512i L = l30; X2_STEP((sl) + 3, X2_B); }                                                   \
++        { const __m512i L = l31; X2_STEP((sl) + 4, X2_B); }                                                   \
++        { const __m512i L = l32; X2_STEP((sl) + 5, X2_B); }                                                   \
++        { const __m512i L = l30; X2_STEP((sl) + 6, X2_E); }                                                   \
++        { const __m512i L = l31; X2_STEP((sl) + 7, X2_E); }                                                   \
++        { const __m512i L = l32; X2_STEP((sl) + 8, X2_E); }                                                   \
++        } while (0)
++    for (int64_t sb = 0; sb < e->nsb; ++sb, b0 += PTQ1V_STEPS / 8, s0 += PTQ1V_STEPS) {
++#pragma GCC unroll 4
++        for (int u = 0; u < 4; ++u) {
++            __m512i T[NP];
++            for (int p = 0; p < NP; ++p) T[p] = _mm512_setzero_si512();
++#pragma GCC unroll 4
++            for (int pp = 0; pp < 4; ++pp) X2_PAIR(u * 512 + pp * 128, u * 38 + pp * 9, pp, 1);
++            { const __m512i L = l20; X2_STEP(u * 38 + 36, X2_T); }
++            { const __m512i L = l21; X2_STEP(u * 38 + 37, X2_T); }
++        }
++        for (int p = 0; p < NP; ++p) P[p] += PTQ1V_SBB;
++    }
++    for (int64_t sb = 0; sb < e->n36; ++sb, b0 += PTQ1W_STEPS / 8, s0 += PTQ1W_STEPS) {
++        __m512i T[NP]; (void) T;
++#pragma GCC unroll 8
++        for (int pp = 0; pp < 8; ++pp) X2_PAIR(pp * 128, pp * 9, pp, 0);
++        for (int p = 0; p < NP; ++p) P[p] += PTQ1W_SBB;
++    }
++#undef X2_PAIR
++#undef X2_STEP
++#undef X2_A
++#undef X2_B
++#undef X2_E
++#undef X2_T
++    for (int p = 0; p < NP; ++p) {
++        const int64_t r0 = row0 + p * PTQ1P_ROWS;
++        const int64_t nr = (e->rows - r0) < PTQ1P_ROWS ? (e->rows - r0) : PTQ1P_ROWS;
++        if (nr <= 0) continue;
++        for (int t = 0; t < NT; ++t) _mm512_mask_storeu_ps(dst + t * ld + r0, (__mmask16) ((1u << nr) - 1), accf[p][t]);
++    }
++}
++// panels [p0, p1) x m tokens (2 <= m <= 4): pairs through x2_panel2_nt, an odd last panel through ptq1v_gemm_m's kernel
++static void x2_panels_m(const ptq1p_entry * e, const uint8_t * acts, size_t cb, int64_t m, int64_t p0, int64_t p1, float * dst, int64_t ld) {
++    int64_t p = p0;
++    for (; p + 2 <= p1; p += 2) {
++        const uint8_t * pan = e->packed + p * e->panel_stride;
++        switch (m) {
++            case 2: x2_panel2_nt(e, pan, acts, cb, 2, X2_PF, dst, ld, p * PTQ1P_ROWS); break;
++            case 3: x2_panel2_nt(e, pan, acts, cb, 3, X2_PF, dst, ld, p * PTQ1P_ROWS); break;
++            default: x2_panel2_nt(e, pan, acts, cb, 4, X2_PF, dst, ld, p * PTQ1P_ROWS); break;
++        }
++    }
++    if (p < p1) ptq1v_gemm_m(e, acts, cb, m, p, p1, dst, ld);
++}
++#endif
++
++// X2 bit 4: a ternary MUL_MAT whose activations are 3D [k, n_seq_tokens, n_seqs] (the Gated-DeltaNet layers' projections
++// when a ubatch holds several sequences) misses ptq1f_applies (it wants ne[2] == 1) and falls back to the fork's kernel.
++// Its src1 and dst are contiguous, so the same call on a flat [k, n_seq_tokens * n_seqs] view is the same product,
++// column by column (the fast kernels are bit-identical per column). Only when the planned work buffer fits.
++static int x2_ptq1_mode = -1;
++static int x2_ptq1_3d(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params) {
++    if (x2_ptq1_mode < 0) { const char * e = getenv("GGML_X2"); x2_ptq1_mode = e ? atoi(e) : 0; }
++    if (!(x2_ptq1_mode & 4) || params->use_ref) return -1;
++    struct ggml_tensor * d = cg->nodes[i];
++    if (d->op != GGML_OP_MUL_MAT || d->src[0]->type != GGML_TYPE_PTQ1_0) return -1;
++    const struct ggml_tensor * b = d->src[1];
++    if (b->ne[2] < 2 || b->ne[3] != 1 || d->ne[3] != 1 || !ggml_is_contiguous(b) || !ggml_is_contiguous(d) || b->type != GGML_TYPE_F32) return -1;
++    struct ggml_tensor b2 = *b, d2 = *d;
++    b2.ne[1] = b->ne[1] * b->ne[2]; b2.ne[2] = 1; b2.nb[2] = b2.nb[3] = b2.nb[1] * b2.ne[1];
++    d2.ne[1] = d->ne[1] * d->ne[2]; d2.ne[2] = 1; d2.nb[2] = d2.nb[3] = d2.nb[1] * d2.ne[1];
++    d2.src[1] = &b2;
++    if (!ptq1f_applies(d2.src[0], &b2) || ptq1f_wsize(d2.src[0], &b2) > params->wsize) return -1;
++    return ptq1f_mul_mat(params, &d2) ? 1 : -1;
++}
++
++// X2 bit 32: ternary MUL_MATs of a multi-sequence decode step (2..4 columns, 2D or 3D activations) through x2_panels_m
++// (x2-kernel.inc: two panels per core x all columns). The flow is ptq1p_mul_mat's small (mode 6) path: shared block-range
++// quantize of every column, a barrier, dynamic chunks of panels. Only once the weights are repacked (else -1: the stock
++// call repacks), mode 7, and the planned work buffer fits.
++static __thread const struct ggml_cgraph * x2_cg_last; static __thread int x2_cg_last_i = 1 << 30, x2_cg_multi;
++static void x2_graph_check(const struct ggml_cgraph * cg, int i) {
++    if (cg != x2_cg_last || i < x2_cg_last_i) {   // new graph: is it a multi-sequence one-token-per-sequence step?
++        x2_cg_multi = 0;
++        for (int j = 0; j < cg->n_nodes; ++j) {
++            const struct ggml_tensor * g = cg->nodes[j];
++            if (g->op == GGML_OP_GATED_DELTA_NET) { x2_cg_multi = g->src[2]->ne[2] == 1 && g->src[2]->ne[3] >= 2; break; }
++        }
++    }
++    x2_cg_last = cg; x2_cg_last_i = i;
++}
++static int x2_ptq1_small(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params) {
++    if (x2_ptq1_mode < 0) { const char * e = getenv("GGML_X2"); x2_ptq1_mode = e ? atoi(e) : 0; }
++    if (!(x2_ptq1_mode & 32) || params->use_ref) return -1;
++#if defined(PTQ1V_OK) && PTQ1V_OK
++    x2_graph_check(cg, i);
++    struct ggml_tensor * d = cg->nodes[i];
++    if (!x2_cg_multi || d->op != GGML_OP_MUL_MAT || d->src[0]->type != GGML_TYPE_PTQ1_0 || !ptq1p_mode7()) return -1;
++    const struct ggml_tensor * a = d->src[0], * b = d->src[1];
++    const int64_t m = b->ne[1] * b->ne[2], k = a->ne[0];
++    if (m < 2 || m > 4 || b->ne[3] != 1 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || !ggml_is_contiguous(d) ||
++        a->ne[2] != 1 || a->ne[3] != 1 || !ggml_is_contiguous(a) || k % 128 != 0 || !ptq1f_enabled()) return -1;
++    ptq1p_entry * e = NULL;
++    for (ptq1p_entry * it = __atomic_load_n(&ptq1p_list, __ATOMIC_ACQUIRE); it; it = it->next) if (it->src == a->data) { e = it; break; }
++    if (!e) return -1;
++    const size_t cb = ptq1v_col_bytes(k);
++    if (cb * (size_t) m + 64 > params->wsize) return -1;
++    const int ith = params->ith, nth = params->nth;
++    uint8_t * acts = (uint8_t *) (((uintptr_t) params->wdata + 63) & ~(uintptr_t) 63);
++    ggml_threadpool_chunk_set(params->threadpool, nth);
++    const int64_t nb = k / 32, per = (nb + nth - 1) / nth;
++    for (int64_t t = 0; t < m; ++t) {
++        const float * x = (const float *) ((const char *) b->data + t * b->nb[1]);   // contiguous: column t of the flat view
++        if (ptq1p_k6() & 8) ptq1k6_quantize_part(x, k, e->kpad, acts + t * cb, PTQ1F_MIN(nb, ith * per), PTQ1F_MIN(nb, (ith + 1) * per), 1);
++        else ptq1p_quantize_col_part_kp(x, k, e->kpad, acts + t * cb, PTQ1F_MIN(nb, ith * per), PTQ1F_MIN(nb, (ith + 1) * per), 1);
++    }
++    ggml_barrier(params->threadpool);
++    const int64_t ch = PTQ1F_MIN(8, ((e->npanel + 8 * nth - 1) / (8 * nth) + 1) / 2 * 2);   // even: the panel pairs line up
++    const int64_t nch = (e->npanel + ch - 1) / ch;
++    for (int64_t c = ith; c < nch; c = ggml_threadpool_chunk_add(params->threadpool, 1))
++        x2_panels_m(e, acts, cb, m, c * ch, PTQ1F_MIN(e->npanel, (c + 1) * ch), (float *) d->data, d->nb[1] / sizeof(float));
++    return 1;
++#else
++    (void) cg; (void) i; return -1;
++#endif
++}
++
++// X2 bit 8: in a multi-sequence decode graph (its Gated-DeltaNet nodes have one token for each of >= 2 sequences), a
++// BF16 MUL_MAT (the GDN layers' alpha/beta projections) with 2..8 activation columns would go to llamafile's tinyBLAS
++// (n >= 2), whose float order differs from the n = 1 vec_dot path a single stream takes. Compute every (row, column) with
++// that n = 1 path's own conversion and vec_dot call (so the same values as alone), one barrier in all.
++static int x2_col_mm(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params) {
++    if (x2_ptq1_mode < 0) { const char * e = getenv("GGML_X2"); x2_ptq1_mode = e ? atoi(e) : 0; }
++    if (!(x2_ptq1_mode & 8) || params->use_ref) return -1;
++    x2_graph_check(cg, i);
++    struct ggml_tensor * d = cg->nodes[i];
++    if (!x2_cg_multi || d->op != GGML_OP_MUL_MAT || d->src[0]->type != GGML_TYPE_BF16) return -1;
++    const struct ggml_tensor * b = d->src[1];
++    if (b->ne[1] < 2 || b->ne[1] > 8 || b->ne[2] != 1 || b->ne[3] != 1 || d->src[0]->ne[2] != 1 || d->src[0]->ne[3] != 1 ||
++        b->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32) return -1;
++    // one pass with the stock n = 1 arithmetic: every column converted to the vec_dot type exactly as the stock op does
++    // (elementwise, any split), then each (row, column) is one vec_dot call -- the call the stock n = 1 path makes
++    const struct ggml_tensor * a = d->src[0];
++    const enum ggml_type vt = type_traits_cpu[a->type].vec_dot_type;
++    ggml_from_float_t const from_float = type_traits_cpu[vt].from_float;
++    ggml_vec_dot_t const vec_dot = type_traits_cpu[a->type].vec_dot;
++    const int64_t K = b->ne[0], R = a->ne[1], C = b->ne[1];
++    const size_t rs = ggml_row_size(vt, K), bs = ggml_blck_size(vt);
++    if (type_traits_cpu[a->type].nrows != 1 || !from_float || rs * (size_t) C > params->wsize || K != a->ne[0]) return -1;
++    const int ith = params->ith, nth = params->nth;
++    char * w = (char *) params->wdata;
++    for (int64_t c = 0; c < C; ++c) {
++        const int64_t s0 = (ith * K / (int64_t) bs) / nth, s1 = ((ith + 1) * K / (int64_t) bs) / nth;
++        from_float((const float *) ((const char *) b->data + c * b->nb[1]) + s0 * bs, w + c * rs + s0 * ggml_type_size(vt), (s1 - s0) * bs);
++    }
++    ggml_barrier(params->threadpool);
++    for (int64_t q = ith; q < R * C; q += nth) {
++        const int64_t r = q % R, c = q / R;
++        float v;
++        vec_dot((int) K, &v, 0, (const char *) a->data + r * a->nb[1], 0, w + c * rs, 0, 1);
++        *(float *) ((char *) d->data + c * d->nb[1] + r * d->nb[0]) = v;
++    }
++    return 1;
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3180,7 +3418,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         // K6: -1 = not handled; 0 = folded into a later op (nothing to compute, nothing to sync); r > 0 = computed r nodes
+-        const int k6r = ggml_x1_node(cgraph, node_n, &params);
++        int x2r = ggml_x2_node(cgraph, node_n, &params);   // X2: same return convention, -1 when off
++        if (x2r == -1) x2r = x2_ptq1_small(cgraph, node_n, &params);
++        if (x2r == -1) x2r = x2_ptq1_3d(cgraph, node_n, &params);
++        if (x2r == -1) x2r = x2_col_mm(cgraph, node_n, &params);
++        const int k6r = x2r != -1 ? x2r : ggml_x1_node(cgraph, node_n, &params);
+         if (k6r == 0) {
+             continue;
+         }
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 449d40bc..68847203 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -13151,3 +13151,373 @@ extern "C" int ggml_x1_node(const struct ggml_cgraph * cg, int i, const struct g
+ }
+ #endif
+ // ---- end X1 ----
++
++
++// ---- X2: multi-sequence decode state fusions, GGML_X2 bitmask, off by default ----
++static int x2_mode_v = -1, x2_dbg_v = -1;
++static long x2_dbg_n[8];        // thread 0: GDN in-place nodes, conv fused nodes, GDN seqs, conv seqs, per-stream FA nodes, norm/glu/sign chains
++static long x2_dbg_m[10];       // thread 0: ternary MUL_MAT calls by M = ne1 * ne2 (9 = more than 8); [0] = calls with 3D activations
++static void x2_dbg_dump(void) {
++    fprintf(stderr, "X2: gdn_inplace %ld (seqs %ld), conv_fused %ld (seqs %ld), fa_per_stream %ld, chains norm %ld glu %ld sign %ld; ptq1 M hist:", x2_dbg_n[0], x2_dbg_n[2], x2_dbg_n[1], x2_dbg_n[3], x2_dbg_n[4], x2_dbg_n[5], x2_dbg_n[6], x2_dbg_n[7]);
++    for (int i = 1; i < 10; ++i) fprintf(stderr, " %s%d=%ld", i == 9 ? ">" : "", i == 9 ? 8 : i, x2_dbg_m[i]);
++    fprintf(stderr, " (3D activations: %ld)\n", x2_dbg_m[0]);
++}
++static const ggml_tensor * x2_base(const ggml_tensor * t) {
++    while (t && t->view_src && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) t = t->view_src;
++    return t;
++}
++static int x2_index_of(const ggml_cgraph * cg, const ggml_tensor * t, int from, int to) {
++    for (int j = from < 0 ? 0 : from; j <= to && j < cg->n_nodes; ++j) if (cg->nodes[j] == t) return j;
++    return -1;
++}
++// a GET_ROWS gathering n >= 2 consecutive f32 rows h..h+n-1 (in order) of a 2D cache: the address of row h, else NULL
++static float * x2_rows_addr(const ggml_tensor * g, int64_t * n_out) {
++    if (!g || g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32 || g->ne[1] < 2 || g->ne[2] != 1 || g->ne[3] != 1 || !ggml_is_contiguous(g)) return NULL;
++    const ggml_tensor * cache = g->src[0], * idx = g->src[1];
++    if (cache->type != GGML_TYPE_F32 || cache->nb[0] != sizeof(float) || cache->ne[0] != g->ne[0] || cache->ne[2] != 1 || cache->ne[3] != 1 ||
++        cache->nb[1] != (size_t) cache->ne[0] * sizeof(float) || idx->type != GGML_TYPE_I32 || ggml_nelements(idx) != g->ne[1] ||
++        !ggml_is_contiguous(idx) || !cache->data || !idx->data) return NULL;
++    const int32_t * id = (const int32_t *) idx->data;
++    const int64_t n = g->ne[1];
++    if (id[0] < 0 || id[0] + n > cache->ne[1]) return NULL;
++    for (int64_t s = 1; s < n; ++s) if (id[s] != id[0] + s) return NULL;
++    *n_out = n;
++    return (float *) ((char *) cache->data + (size_t) id[0] * cache->nb[1]);
++}
++static bool x2_ovl(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a || !b || !a->data || !b->data) return false;
++    const char * pa = (const char *) a->data, * pb = (const char *) b->data;
++    return pa < pb + ggml_nbytes(b) && pb < pa + ggml_nbytes(a);
++}
++
++// bit 1: GDN node (K = 1, one token per sequence, n >= 2 sequences, gathered mode) whose state input is the gather of
++// rows h..h+n-1 and whose new states are copied back to those rows -> row h's address (and the CPY), else NULL
++static float * x2_gdn_match(const ggml_cgraph * cg, int i_gdn, const ggml_tensor ** cpy_out) {
++    const ggml_tensor * d = cg->nodes[i_gdn];
++    if (d->op != GGML_OP_GATED_DELTA_NET || d->src[6] || ggml_get_op_params_i32(d, 0) != 1) return NULL;
++    const ggml_tensor * v = d->src[2];
++    if (v->ne[2] != 1 || v->ne[3] < 2) return NULL;
++    const ggml_tensor * g = x2_base(d->src[5]);
++    int64_t n = 0;
++    float * addr = x2_rows_addr(g, &n);
++    if (!addr || n != v->ne[3]) return NULL;
++    const int64_t S_v = v->ne[0], H = v->ne[1];
++    const size_t state_bytes = (size_t) S_v * S_v * H * sizeof(float);
++    if ((size_t) g->ne[0] * sizeof(float) != state_bytes || !ggml_is_contiguous(d->src[5]) || d->src[5]->nb[3] != state_bytes) return NULL;
++    const int ig = x2_index_of(cg, g, i_gdn - 32, i_gdn);
++    if (ig < 0 || ggml_node_get_use_count(cg, ig) != 1) return NULL;
++    if (d->src[5] != g) {
++        const int ir = x2_index_of(cg, d->src[5], ig, i_gdn);
++        if (ir < 0 || ggml_node_get_use_count(cg, ir) != 1) return NULL;
++    }
++    for (int j = i_gdn + 1; j < cg->n_nodes && j <= i_gdn + 16; ++j) {
++        const ggml_tensor * cp = cg->nodes[j];
++        if (cp->op == GGML_OP_CPY && x2_base(cp->src[0]) == d) {
++            const ggml_tensor * sv = cp->src[0];
++            if (cp->type != GGML_TYPE_F32 || cp->data != (void *) addr || !ggml_is_contiguous(cp) || ggml_nbytes(cp) != state_bytes * n ||
++                sv->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) || sv->view_offs != (size_t) S_v * H * n * sizeof(float)) return NULL;
++            if (cpy_out) *cpy_out = cp;
++            return addr;
++        }
++    }
++    return NULL;
++}
++
++// the GDN step for every (head, sequence), in place on the cache rows; the stock one-chunk body with only the state
++// location changed (K = 1, n_tokens = 1)
++static void x2_gdn_compute(const ggml_tensor * dst, float * state0, const ggml_compute_params * params) {
++    const ggml_tensor * src_q = dst->src[0], * src_k = dst->src[1], * src_v = dst->src[2], * src_g = dst->src[3], * src_beta = dst->src[4];
++    const bool raw_gates = ggml_get_op_params_i32(dst, 1) != 0;
++    const float * raw_dt_bias = raw_gates ? (const float *) dst->src[7]->data : nullptr;
++    const float * raw_a = raw_gates ? (const float *) dst->src[8]->data : nullptr;
++    const int64_t S_v = src_v->ne[0], H = src_v->ne[1], n_seqs = src_v->ne[3];
++    const bool kda = src_g->ne[0] == S_v;
++    const int64_t rq3 = src_v->ne[3] / src_q->ne[3], rk3 = src_v->ne[3] / src_k->ne[3];
++    float * attn_out_base = (float *) dst->data;
++    const float scale = 1.0f / sqrtf((float) S_v);
++    float * delta = (float *) params->wdata + params->ith * S_v + CACHE_LINE_SIZE_F32;   // the stock op's scratch (K = 1)
++    // dynamic chunks of 2 (head, sequence) rows: the rows are independent, so any assignment gives the same values
++    if (params->ith == 0) ggml_threadpool_chunk_set(params->threadpool, params->nth);
++    ggml_barrier(params->threadpool);
++    const int64_t nrow = H * n_seqs, dr = 2, nch = (nrow + dr - 1) / dr;
++    for (int64_t c = params->ith; c < nch; c = ggml_threadpool_chunk_add(params->threadpool, 1))
++    for (int64_t ir = c * dr; ir < std::min(nrow, (c + 1) * dr); ++ir) {
++        const int64_t iv1 = ir % H, iv3 = ir / H;
++        const int64_t iq1 = iv1 % src_q->ne[1], ik1 = iv1 % src_k->ne[1], iq3 = iv3 / rq3, ik3 = iv3 / rk3;
++        float * s_out = state0 + (iv3 * H + iv1) * S_v * S_v;
++        float * attn_data = attn_out_base + (iv3 * H + iv1) * S_v;
++        const float * q_d = (const float *) ((const char *) src_q->data + iq3 * src_q->nb[3] + iq1 * src_q->nb[1]);
++        const float * k_d = (const float *) ((const char *) src_k->data + ik3 * src_k->nb[3] + ik1 * src_k->nb[1]);
++        const float * v_d = (const float *) ((const char *) src_v->data + iv3 * src_v->nb[3] + iv1 * src_v->nb[1]);
++        float beta_val = *(const float *) ((const char *) src_beta->data + iv3 * src_beta->nb[3] + iv1 * src_beta->nb[1]);
++        const float * g_d = (const float *) ((const char *) src_g->data + iv3 * src_g->nb[3] + iv1 * src_g->nb[1]);
++        float g0 = g_d[0];
++        if (raw_gates) {
++            beta_val = 1.0f / (1.0f + expf(-beta_val));
++            const float x = g0 + raw_dt_bias[iv1];
++            g0 = raw_a[iv1] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
++        }
++        if (kda) {
++            for (int64_t i = 0; i < S_v; ++i) delta[i] = expf(g_d[i]);
++            for (int64_t j = 0; j < S_v; ++j) ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
++        } else {
++            ggml_vec_scale_f32(S_v * S_v, s_out, expf(g0));
++        }
++        for (int64_t j = 0; j < S_v; ++j) { float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1); delta[j] = (v_d[j] - sum) * beta_val; }
++        for (int64_t j = 0; j < S_v; ++j) ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
++        for (int64_t j = 0; j < S_v; ++j) { float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1); attn_data[j] = sum * scale; }
++    }
++}
++
++// bit 2: SSM_CONV node i_s (one token per sequence, n >= 2) over CONCAT(reshaped gather of 3-column rows h..h+n-1, the
++// new column) with the CPY of the last three columns back to those rows
++struct x2_conv_m { float * addr; const ggml_tensor * g, * cat, * cpy, * xs; int64_t n; };
++static bool x2_conv_match(const ggml_cgraph * cg, int i_s, x2_conv_m * m) {
++    const ggml_tensor * s = cg->nodes[i_s];
++    if (s->op != GGML_OP_SSM_CONV || s->type != GGML_TYPE_F32 || s->ne[1] != 1 || s->ne[2] < 2) return false;
++    const ggml_tensor * cat = s->src[0], * w = s->src[1];
++    const int64_t nr = s->ne[0], n = s->ne[2];
++    if (cat->op != GGML_OP_CONCAT || cat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cat, 0) != 0 || cat->ne[0] != 4 || cat->ne[1] != nr ||
++        cat->ne[2] != n || cat->ne[3] != 1 || !ggml_is_contiguous(cat) || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != nr) return false;
++    const ggml_tensor * st = cat->src[0], * xs = cat->src[1];
++    if (st->type != GGML_TYPE_F32 || st->ne[0] != 3 || st->ne[1] != nr || st->ne[2] != n || !ggml_is_contiguous(st) ||
++        xs->type != GGML_TYPE_F32 || xs->ne[0] != 1 || xs->ne[1] != nr || xs->ne[2] != n || xs->nb[1] != sizeof(float) || !xs->data) return false;
++    const ggml_tensor * g = x2_base(st);
++    int64_t ng = 0;
++    float * addr = x2_rows_addr(g, &ng);
++    if (!addr || ng != n || g->ne[0] != 3 * nr) return false;
++    const int ig = x2_index_of(cg, g, i_s - 32, i_s);
++    const int ic = x2_index_of(cg, cat, ig < 0 ? 0 : ig, i_s);
++    if (ig < 0 || ic < 0 || ggml_node_get_use_count(cg, ig) != 1 || ggml_node_get_use_count(cg, ic) != 2) return false;
++    if (st != g) { const int ir = x2_index_of(cg, st, ig, ic); if (ir < 0 || ggml_node_get_use_count(cg, ir) != 1) return false; }
++    const ggml_tensor * cpy = NULL;
++    for (int j = ic + 1; j < cg->n_nodes && j <= i_s + 1; ++j) {
++        const ggml_tensor * nd = cg->nodes[j];
++        if (nd->op == GGML_OP_CPY && x2_base(nd->src[0]) == cat) {
++            const ggml_tensor * vw = nd->src[0];
++            if (vw->view_offs != sizeof(float) || vw->ne[0] != 3 || vw->ne[1] != nr || vw->ne[2] != n || vw->nb[0] != sizeof(float) ||
++                vw->nb[1] != 4 * sizeof(float) || vw->nb[2] != cat->nb[2] || nd->type != GGML_TYPE_F32 || nd->data != (void *) addr ||
++                !ggml_is_contiguous(nd) || ggml_nbytes(nd) != (size_t) 3 * nr * n * sizeof(float)) return false;
++            cpy = nd;
++        }
++    }
++    if (!cpy || x2_ovl(cat, xs) || x2_ovl(cat, g->src[0])) return false;
++    m->addr = addr; m->g = g; m->cat = cat; m->cpy = cpy; m->xs = xs; m->n = n;
++    return true;
++}
++// conv input (seq s, row r) = (state row, x[s][r]); state row <- (s1, s2, x) in place; any split gives the same bytes
++static void x2_conv_step(const x2_conv_m * m, const ggml_compute_params * params) {
++    const int64_t nr = m->cat->ne[1], tot = nr * m->n, dr = (tot + params->nth - 1) / params->nth;
++    const int64_t r0 = MIN(dr * params->ith, tot), r1 = MIN(r0 + dr, tot);
++    float * st = m->addr, * ci = (float *) m->cat->data;
++    int64_t s = r0 / nr, r = r0 % nr;   // walked incrementally (no division per row)
++    for (int64_t q = r0; q < r1; ++q, ++r) {
++        if (r == nr) { r = 0; ++s; }
++        const float xr = *(const float *) ((const char *) m->xs->data + s * m->xs->nb[2] + r * sizeof(float));
++        float * row = st + q * 3;   // rows are contiguous: seq s row r at (s * nr + r) * 3
++        float * c4 = (float *) ((char *) ci + s * m->cat->nb[2]) + 4 * r;
++        const float a = row[0], b = row[1], c = row[2];
++        c4[0] = a; c4[1] = b; c4[2] = c; c4[3] = xr;
++        row[0] = b; row[1] = c; row[2] = xr;
++    }
++}
++
++// bit 16: FLASH_ATTN_EXT over n_stream >= 2 per-sequence KV streams, one query token per stream (decode). The stock op
++// takes the one-chunk path for every (head, stream) over the common n_kv (max over streams), while one stream alone takes
++// the split-KV path once its n_kv >= 512 (different float order). Here each stream runs as its own op call, with the
++// n_kv the cache would give it alone (its last visible cell + 1, padded to 256 like llama_kv_cache::get_n_kv), so the
++// dispatch and the KV chunk bounds are the single-stream ones.
++static int x2_fa(ggml_tensor * d, const ggml_compute_params * params) {
++    const ggml_tensor * q = d->src[0], * k = d->src[1], * v = d->src[2], * m = d->src[3];
++    if (!m || q->ne[1] != 1 || q->ne[3] < 2 || k->ne[3] != q->ne[3] || v->ne[3] != q->ne[3] || m->ne[3] != q->ne[3] ||
++        m->type != GGML_TYPE_F16 || m->ne[2] != 1 || d->ne[3] != q->ne[3] || (d->src[4] && d->src[4]->ne[3] > 1)) return -1;
++    const int64_t ns = q->ne[3], nkv = k->ne[1];
++    for (int64_t s = 0; s < ns; ++s) {
++        const ggml_fp16_t * mr = (const ggml_fp16_t *) ((const char *) m->data + s * m->nb[3]);   // row of query 0
++        int64_t last = -1;
++        for (int64_t c = nkv - 1; c >= 0; --c) if (GGML_CPU_FP16_TO_FP32(mr[c]) != -INFINITY) { last = c; break; }
++        const int64_t nk = std::min<int64_t>(nkv, std::max<int64_t>(256, (last + 1 + 255) / 256 * 256));
++        ggml_tensor q2 = *q, k2 = *k, v2 = *v, m2 = *m, d2 = *d;
++        q2.ne[3] = 1; q2.data = (char *) q->data + s * q->nb[3];
++        k2.ne[3] = 1; k2.ne[1] = nk; k2.data = (char *) k->data + s * k->nb[3];
++        v2.ne[3] = 1; v2.ne[1] = nk; v2.data = (char *) v->data + s * v->nb[3];
++        m2.ne[3] = 1; m2.ne[0] = nk; m2.data = (char *) m->data + s * m->nb[3];
++        d2.ne[3] = 1; d2.data = (char *) d->data + s * d->nb[3];
++        d2.src[0] = &q2; d2.src[1] = &k2; d2.src[2] = &v2; d2.src[3] = &m2;
++        if (s > 0) ggml_barrier(params->threadpool);   // the op's chunk counter / partials are reused by the next call
++        ggml_compute_forward_flash_attn_ext(params, &d2);
++    }
++    return 1;
++}
++
++// bit 64: the one-row chains K6 fuses (bits 16/32/64), on the n = 2..8 rows of a multi-sequence decode step:
++// [RMS_NORM, MUL(w), MUL(sign), RESHAPE, FWHT], [GLU(swiglu), MUL(sign), RESHAPE, FWHT], [MUL(sign), RESHAPE, FWHT].
++// Each (row, 1024-block) unit is computed with K6's arithmetic (x * scale * w, the stock sequential double sum of
++// squares per row, ggml_vec_swiglu_f32 / ggml_vec_mul_f32 per block, k6_fwht_row), i.e. what a single stream computes
++// alone with K6 on; units are split in contiguous ranges, a thread computing the sum of squares of each row it touches.
++// Only in multi-sequence one-token-per-sequence graphs (a prefill tail of a few tokens alone runs the stock ops).
++static thread_local const ggml_cgraph * x2o_cg; static thread_local int x2o_last = 1 << 30, x2o_multi;
++static bool x2o_is_multi(const ggml_cgraph * cg, int i) {
++    if (cg != x2o_cg || i < x2o_last) {
++        x2o_multi = 0;
++        for (int j = 0; j < cg->n_nodes; ++j) {
++            const ggml_tensor * g = cg->nodes[j];
++            if (g->op == GGML_OP_GATED_DELTA_NET) { x2o_multi = g->src[2]->ne[2] == 1 && g->src[2]->ne[3] >= 2; break; }
++        }
++    }
++    x2o_cg = cg; x2o_last = i;
++    return x2o_multi;
++}
++#if defined(GGML_SIMD)
++static bool x2_rows(const ggml_tensor * t, int64_t D, int64_t n) {
++    return t->type == GGML_TYPE_F32 && t->ne[0] == D && ggml_nelements(t) == D * n && ggml_is_contiguous(t);
++}
++struct x2_chain { int n_nodes; int64_t rows; k6_chain k; };
++static bool x2_chain_match(const ggml_cgraph * cg, int i, x2_chain * xc) {
++    const ggml_tensor * n0 = cg->nodes[i];
++    k6_chain * ch = &xc->k;
++    int j = i;
++    ch->norm = ch->glu = NULL; ch->mulw = NULL;
++    const int64_t D = n0->ne[0];
++    if (D <= 0 || ggml_nelements(n0) % D) return false;
++    const int64_t n = ggml_nelements(n0) / D;
++    if (n < 2 || n > 8) return false;
++    if (n0->op == GGML_OP_RMS_NORM) {
++        if (!x2_rows(n0, D, n) || !x2_rows(n0->src[0], D, n) || ggml_node_get_use_count(cg, i) != 1 || j + 1 >= cg->n_nodes) return false;
++        const ggml_tensor * m = cg->nodes[++j];
++        if (m->op != GGML_OP_MUL || m->src[0] != n0 || !x2_rows(m, D, n) || !k6_row1(m->src[1], D)) return false;
++        ch->norm = n0; ch->mulw = m;
++    } else if (n0->op == GGML_OP_GLU) {
++        if (ggml_get_glu_op(n0) != GGML_GLU_OP_SWIGLU || !n0->src[1] || !x2_rows(n0, D, n) || !x2_rows(n0->src[0], D, n) || !x2_rows(n0->src[1], D, n)) return false;
++        ch->glu = n0; ch->mulw = n0;
++    } else if (n0->op == GGML_OP_MUL) {
++        if (!x2_rows(n0, D, n) || !x2_rows(n0->src[0], D, n)) return false;
++        ch->mulw = n0->src[0]; j = i - 1;
++    } else return false;
++    if (j + 3 >= cg->n_nodes) return false;
++    const ggml_tensor * sg = cg->nodes[++j];
++    if (sg->op != GGML_OP_MUL || sg->src[0] != ch->mulw || !x2_rows(sg, D, n) || !k6_row1(sg->src[1], D)) return false;
++    const ggml_tensor * r = cg->nodes[++j];
++    if (r->op != GGML_OP_RESHAPE || r->view_src != sg) return false;
++    const ggml_tensor * h = cg->nodes[++j];
++    if (h->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(h, 1) != GGML_HINT_SRC0_IS_HADAMARD || h->src[1] != r || h->src[0]->type != GGML_TYPE_F32 ||
++        h->type != GGML_TYPE_F32 || !ggml_is_contiguous(h) || ggml_nelements(h) != D * n) return false;
++    const int64_t hn = h->src[0]->ne[0];
++    if (hn < 16 || (hn & (hn - 1)) || r->ne[0] != hn || h->ne[0] != hn || D % hn != 0 || !k6_step_ok(hn)) return false;
++    ch->muls = sg; ch->fwht = h; ch->hn = hn; ch->D = D; ch->n = j - i + 1;
++    {   // the K7 rule, as in k6_chain_match
++        const ggml_tensor * outs[3] = { ch->mulw, sg, h };
++        if (ch->norm) { const ggml_tensor * ins[3] = { ch->norm->src[0], ch->mulw->src[1], sg->src[1] }; const bool ok[3] = { false, false, false };
++                        if (!k6_disjoint(outs, 3, ins, ok, 3)) return false; }
++        else if (ch->glu) { const ggml_tensor * ins[3] = { ch->glu->src[0], ch->glu->src[1], sg->src[1] }; const bool ok[3] = { true, true, false };
++                            if (!k6_disjoint(outs, 3, ins, ok, 3)) return false; }
++        else { const ggml_tensor * outs2[2] = { sg, h }; const ggml_tensor * ins[2] = { ch->mulw, sg->src[1] }; const bool ok[2] = { true, false };
++               if (!k6_disjoint(outs2, 2, ins, ok, 2)) return false; }
++    }
++    xc->rows = n; xc->n_nodes = ch->n;
++    return true;
++}
++static void x2_chain_compute(const x2_chain * xc, const ggml_compute_params * params) {
++    const k6_chain * ch = &xc->k;
++    const int64_t D = ch->D, hn = ch->hn, nblk = D / hn, U = xc->rows * nblk;
++    const int64_t u0 = U * params->ith / params->nth, u1 = U * (params->ith + 1) / params->nth;
++    const float * x = ch->norm ? (const float *) ch->norm->src[0]->data : NULL;
++    const float * w = ch->norm ? (const float *) ch->mulw->src[1]->data : NULL;
++    float eps = 0.0f; if (ch->norm) memcpy(&eps, ch->norm->op_params, sizeof(float));
++    float * y1 = (float *) ch->mulw->data, * y2 = (float *) ch->muls->data, * out = (float *) ch->fwht->data;
++    const float * sg = (const float *) ch->muls->src[1]->data;
++    const float fscale = 1.0f / sqrtf((float) hn);
++    int64_t row_done = -1; float scale = 0.0f;
++    for (int64_t u = u0; u < u1; ++u) {
++        const int64_t row = u / nblk, b = u % nblk, o = row * D + b * hn;
++        if (ch->norm && row != row_done) {   // the stock sequential double sum of this row
++            const float * xr = x + row * D;
++            ggml_float sum = 0.0;
++            for (int64_t q = 0; q < D; q++) sum += (ggml_float)(xr[q] * xr[q]);
++            const float mean = sum / D;
++            scale = 1.0f / sqrtf(mean + eps); row_done = row;
++        }
++        if (ch->norm) {
++            for (int64_t q = 0; q < hn; q++) y1[o + q] = x[o + q] * scale * w[b * hn + q];
++        } else if (ch->glu) {
++            ggml_vec_swiglu_f32((int) hn, y1 + o, (const float *) ch->glu->src[0]->data + o, (const float *) ch->glu->src[1]->data + o);
++        }
++        ggml_vec_mul_f32((int) hn, y2 + o, y1 + o, sg + b * hn);
++        k6_fwht_row(y2 + o, out + o, hn, fscale);
++    }
++}
++#endif
++
++extern "C" int ggml_x2_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params) {
++    if (x2_mode_v < 0) { const char * e = getenv("GGML_X2"); const char * d = getenv("GGML_X2_DBG"); x2_dbg_v = d && atoi(d); x2_mode_v = e ? atoi(e) : 0; }
++    const int mode = x2_mode_v;
++    if ((!mode && !x2_dbg_v) || params->use_ref) return -1;
++    const ggml_tensor * n = cg->nodes[i];
++    const bool dbg = x2_dbg_v && params->ith == 0;
++    if (dbg) {
++        static bool reg = false; if (!reg) { reg = true; atexit(x2_dbg_dump); }
++        if (n->op == GGML_OP_MUL_MAT && n->src[0]->type == GGML_TYPE_PTQ1_0) {
++            const int64_t m = n->src[1]->ne[1] * n->src[1]->ne[2];
++            ++x2_dbg_m[m > 8 ? 9 : m]; x2_dbg_m[0] += n->src[1]->ne[2] > 1;
++        }
++    }
++    if (!mode) return -1;
++#if defined(GGML_SIMD)
++    if ((mode & 64) && (n->op == GGML_OP_RMS_NORM || n->op == GGML_OP_GLU || n->op == GGML_OP_MUL) && x2o_is_multi(cg, i)) {
++        x2_chain xc;
++        if (x2_chain_match(cg, i, &xc)) { x2_chain_compute(&xc, params); if (dbg) ++x2_dbg_n[xc.k.norm ? 5 : xc.k.glu ? 6 : 7]; return xc.n_nodes; }
++        return -1;
++    }
++#endif
++    switch (n->op) {
++        case GGML_OP_GATED_DELTA_NET: {
++            if (!(mode & 1)) return -1;
++            float * addr = x2_gdn_match(cg, i, NULL);
++            if (!addr) return -1;
++            x2_gdn_compute(n, addr, params);
++            if (dbg) { ++x2_dbg_n[0]; x2_dbg_n[2] += n->src[2]->ne[3]; }
++            return 1;
++        }
++        case GGML_OP_CONCAT: {
++            if (!(mode & 2)) return -1;
++            for (int j = i + 1; j < cg->n_nodes && j <= i + 16; ++j)
++                if (cg->nodes[j]->op == GGML_OP_SSM_CONV) {
++                    x2_conv_m m;
++                    if (x2_conv_match(cg, j, &m) && m.cat == n) { x2_conv_step(&m, params); if (dbg) { ++x2_dbg_n[1]; x2_dbg_n[3] += m.n; } return 1; }
++                    return -1;
++                }
++            return -1;
++        }
++        case GGML_OP_GET_ROWS: {
++            int64_t ng = 0;
++            if (n->ne[1] < 2 || !x2_rows_addr(n, &ng)) return -1;
++            for (int j = i + 1; j < cg->n_nodes && j <= i + 32; ++j) {
++                const ggml_tensor * d = cg->nodes[j];
++                if ((mode & 1) && d->op == GGML_OP_GATED_DELTA_NET && x2_base(d->src[5]) == n) return x2_gdn_match(cg, j, NULL) ? 0 : -1;
++                if ((mode & 2) && d->op == GGML_OP_SSM_CONV) { x2_conv_m m; if (x2_conv_match(cg, j, &m) && m.g == n) return 0; }
++            }
++            return -1;
++        }
++        case GGML_OP_CPY: {
++            const ggml_tensor * b = x2_base(n->src[0]);
++            if ((mode & 1) && b->op == GGML_OP_GATED_DELTA_NET) {
++                const int jd = x2_index_of(cg, b, i - 16, i);
++                const ggml_tensor * cp = NULL;
++                return jd >= 0 && x2_gdn_match(cg, jd, &cp) && cp == n ? 0 : -1;
++            }
++            if ((mode & 2) && b->op == GGML_OP_CONCAT) {
++                for (int j = i + 1; j < cg->n_nodes && j <= i + 16; ++j)
++                    if (cg->nodes[j]->op == GGML_OP_SSM_CONV) { x2_conv_m m; return x2_conv_match(cg, j, &m) && m.cpy == n ? 0 : -1; }
++            }
++            return -1;
++        }
++        case GGML_OP_FLASH_ATTN_EXT: {
++            if (!(mode & 16)) return -1;
++            const int r = x2_fa((ggml_tensor *) n, params);
++            if (dbg && r > 0) ++x2_dbg_n[4];
++            return r;
++        }
++        default: return -1;
++    }
++}
++// ---- end X2 ----
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 0d9b40f8..e8797a07 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3056,6 +3056,18 @@ private:
+             }
+         });
+ 
++        // X2: serial prefill -- while a slot has prompt left, the batch is that slot's prompt only
++        static const bool x2_serial = [] { const char * e = getenv("LLAMA_X2_SERIAL_PREFILL"); return e && atoi(e) != 0; }();
++        bool x2_prompt_taken = false;
++        if (x2_serial) {
++            for (auto & s : slots) {
++                if (s.state == SLOT_STATE_PROCESSING_PROMPT || s.state == SLOT_STATE_STARTED) {
++                    generating.clear();   // their i_batch is -1 (reset after the last sampling), so they are skipped after decode
++                    break;
++                }
++            }
++        }
++
+         // update the batch with the sampled/drafted tokens
+         iterate(generating, [&](server_slot & slot) {
+             slot.handle_last_sampled_token(batch);
+@@ -3094,6 +3106,12 @@ private:
+ 
+                 // this slot still has a prompt to be processed
+                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
++                    if (x2_serial) {   // X2: one prompting slot per batch
++                        if (x2_prompt_taken) {
++                            return;
++                        }
++                        x2_prompt_taken = true;
++                    }
+                     const auto & input_tokens = slot.task->tokens;
+ 
+                     // used to determine the number of tokens added to the batch for the current slot
+@@ -3433,6 +3451,15 @@ private:
+                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                             n_swa > 0);
+ 
++                    // X2: LLAMA_X2_CKPT_SPLIT=1 cuts the prompt batches where a checkpointing server would (before the last
++                    // 4 + n_ubatch and the last 4 tokens, and at the user turn) without storing checkpoints (~150 MB of
++                    // recurrent state per slot), so --ctx-checkpoints 0 reads a prompt in the same batches as the release's 1
++                    static const bool x2_ckpt_split_env = [] { const char * e = getenv("LLAMA_X2_CKPT_SPLIT"); return e && atoi(e) != 0; }();
++                    const bool x2_ckpt_split = do_checkpoint || (x2_ckpt_split_env && slot.task->type == SERVER_TASK_TYPE_COMPLETION && (
++                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
++                            n_swa > 0));
++
+                     bool has_mtmd = false;
+ 
+                     // check if we should process the mtmd chunk
+@@ -3508,7 +3535,7 @@ private:
+                         slot.prompt.tokens.push_back(cur_tok);
+ 
+                         // break at the last user message, or at user messages at least min step past the last checkpoint
+-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
++                        if (x2_ckpt_split && spans.is_user_start(slot.prompt.n_tokens())) {
+                             const auto pos = slot.prompt.n_tokens();
+                             const auto & checkpoints = slot.prompt.checkpoints;
+ 
+@@ -3522,7 +3549,7 @@ private:
+                         //  - 4 + n_ubatch
+                         //  - 4
+                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+-                        if (do_checkpoint) {
++                        if (x2_ckpt_split) {
+                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+ 
+                             bool should_break = false;

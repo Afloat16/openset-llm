@@ -1,0 +1,31 @@
+{
+ "ours": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 8 --ctx @C@"
+ },
+ "ours_ns": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 8 --ctx @C@ --no-spec"
+ },
+ "ik": {
+  "env": {},
+  "cmd": "/opt/ik-bin/llama-server -m @H@/.openset-llm/models/model.gguf -t 8 -c @C@ -np 1 -rtr --cache-ram 0 --ctx-checkpoints 1 --jinja"
+ },
+ "prism": {
+  "env": {},
+  "cmd": "/opt/prism-bin/llama-server -m @H@/.openset-llm/models/model.gguf -t 8 -c @C@ -np 1 --cache-ram 0 --ctx-checkpoints 1 --no-webui --jinja"
+ },
+ "prev": {
+  "env": {
+   "OPENSET_LLM_HOME": "@H@/.prev"
+  },
+  "cmd": "@H@/release-prev/serve --threads 8 --ctx @C@",
+  "note": "earlier build (0001-0005)"
+ },
+ "prev_ns": {
+  "env": {
+   "OPENSET_LLM_HOME": "@H@/.prev"
+  },
+  "cmd": "@H@/release-prev/serve --threads 8 --ctx @C@ --no-spec"
+ }
+}

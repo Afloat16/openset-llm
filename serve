@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# serve: chat page at / and an OpenAI-compatible server (POST /v1/chat/completions) on the model install.sh prepared.
+#
+#   ./serve                       # 127.0.0.1:8080, 4k context, speculative decoding on, thinking off
+#   ./serve --host 0.0.0.0 --port 8080 --ctx 8192 --threads 8   # 8k on 8 GB: plain decoding, ~1 GB to spare
+#   ./serve --multi 4             # 4 requests decode together: ~2.3x the total tok/s; no speculation, no resume, 2k ctx each
+#   ./serve --no-webui            # API only: do not serve the chat page at /
+#   ./serve --no-spec             # plain decoding (no speculation)
+#   ./serve --spec                # keep speculation on where serve would turn it off: for lack of memory
+#                                 #   (< 12 GB RAM: --ctx > 4096 without --kv8, > 8192 with) or on a CPU without AVX-512 VNNI
+#   ./serve --think               # let the model think before answering (much longer replies)
+#   ./serve --no-resume           # turn off agent-loop resume (default on; saved prefix states live in $OPENSET_LLM_HOME/state)
+#   ./serve --kv8                 # EXPERIMENTAL: int8 attention cache: 43 % less cache memory, helps on long prompts; not exact
+#   ./serve --fl128               # EXPERIMENTAL: a faster variant that is not bit-identical
+#   ./serve --spec-adapt          # EXPERIMENTAL: adaptive draft depth (--spec-depth N; default 3, 5 on >= 12 GB RAM)
+#   ./serve -- <extra llama-server flags>
+#
+# Defaults are the fastest settings.
+set -euo pipefail
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PREFIX=${OPENSET_LLM_HOME:-$HOME/.openset-llm}
+HOST=127.0.0.1; PORT=8080; CTX=; THREADS=$(nproc); SPEC=1; SPEC_FORCE=0; X1=1; MULTI=0; THINK=off; EXTRA=(); ADAPT=0; DEPTH=; FL128=0; KV8=0; RESUME=1; WEBUI=1
+while [ $# -gt 0 ]; do
+  case $1 in
+    --host|--port|--ctx|--threads|--multi|--spec-depth) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;&
+    --host) HOST=$2; shift ;;
+    --port) PORT=$2; shift ;;
+    --ctx) CTX=$2; shift ;;
+    --threads) THREADS=$2; shift ;;
+    --multi) MULTI=$2; shift ;;
+    --no-spec) SPEC=0 ;;
+    --spec) SPEC_FORCE=1 ;;
+    --no-x1) X1=0 ;;
+    --think) THINK=on ;;
+    --spec-adapt) ADAPT=1 ;;
+    --spec-depth) DEPTH=$2; shift ;;
+    --fl128) FL128=1 ;;
+    --kv8) KV8=1 ;;
+    --no-resume) RESUME=0 ;;
+    --no-webui) WEBUI=0 ;;
+    --) shift; EXTRA=("$@"); break ;;
+    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1 (pass llama-server flags after --)" >&2; exit 2 ;;
+  esac
+  shift
+done
+BIN=$PREFIX/bin; MODEL=$PREFIX/models/model.gguf
+[ -x "$BIN/llama-server" ] && [ -f "$MODEL" ] || { echo "not installed: run ./install.sh first" >&2; exit 1; }
+[ -f "$PREFIX/models/no-mtp" ] && SPEC=0
+case $MULTI in ''|*[!0-9]*) echo "--multi takes a number of streams (2-8)" >&2; exit 2 ;; esac
+for v in "$PORT" "$THREADS" ${CTX:+"$CTX"} ${DEPTH:+"$DEPTH"}; do
+  case $v in ''|*[!0-9]*) echo "--port, --ctx, --threads and --spec-depth take a number (got: $v)" >&2; exit 2 ;; esac
+done
+CKPT=1
+if [ "$MULTI" -ge 2 ]; then
+  # X2: N streams share each pass over the weights. --ctx is per stream here. Speculation is off (X1/MTP + X2 is untested).
+  [ "$MULTI" -gt 8 ] && { echo "--multi: at most 8 streams" >&2; exit 2; }
+  [ "$MULTI" -gt 6 ] && echo "warning: --multi $MULTI > 6: measured 8 streams leave < 0.3 GB free on an 8 GB machine" >&2
+  [ "$SPEC" = 1 ] && echo "note: --multi turns speculation off (the two together are untested)" >&2
+  [ "$RESUME" = 1 ] && echo "note: --multi turns agent-loop resume off" >&2
+  SPEC=0
+  [ -z "$CTX" ] && { [ "$MULTI" -le 4 ] && CTX=2048 || CTX=1024; }
+  NP=$MULTI; CTX_TOTAL=$((CTX * MULTI)); CKPT=0
+  export GGML_X2=${GGML_X2:-95} LLAMA_X2_SERIAL_PREFILL=${LLAMA_X2_SERIAL_PREFILL:-1} LLAMA_X2_CKPT_SPLIT=${LLAMA_X2_CKPT_SPLIT:-1}
+  if [ "$CTX_TOTAL" -gt 8192 ]; then
+    echo "warning: $MULTI streams x $CTX tokens = $CTX_TOTAL > 8192 total; measured safe on 8 GB: 4 x 2048, 6 x 1024" >&2
+  fi
+else
+  NP=1; CTX=${CTX:-4096}; CTX_TOTAL=$CTX
+  if [ "$CTX" -gt 8192 ]; then
+    echo "warning: --ctx $CTX > 8192. On an 8 GB machine the KV cache and recurrent-state checkpoints can push the" >&2
+    echo "         server past RAM; 8192 is the measured-safe limit there." >&2
+  fi
+fi
+args=(-m "$MODEL" -t "$THREADS" -c "$CTX_TOTAL" -ub 256 -np "$NP"
+      --cache-ram 0 --ctx-checkpoints "$CKPT"   # the default 8 GiB host prompt cache would OOM an 8 GB box
+      --reasoning "$THINK" --host "$HOST" --port "$PORT")
+[ "$WEBUI" = 0 ] && args+=(--no-webui)
+ALIAS=openset-llm   # the model id the API reports (instead of the model file's path); your own --alias after -- wins
+for a in "${EXTRA[@]}"; do case $a in -a|--alias) ALIAS= ;; esac; done
+[ -n "$ALIAS" ] && args+=(--alias "$ALIAS")
+SPECNAME=off
+# RAM for the guard rails below: MemTotal, or the container's memory limit when that is lower (Docker and other container hosts
+# report the host's MemTotal; install.sh already checks the cgroup the same way)
+MEM_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+if [ -r /sys/fs/cgroup/memory.max ] && [ "$(cat /sys/fs/cgroup/memory.max)" != max ]; then
+  lim_kb=$(( $(cat /sys/fs/cgroup/memory.max) / 1024 )); [ "$lim_kb" -lt "$MEM_KB" ] && MEM_KB=$lim_kb
+fi
+if [ "$RESUME" = 1 ]; then
+  # 0007: one checkpoint in RAM (as before), placed where the next request will resume; prefix states on disk (~0.3 GB each)
+  export LLAMA_RESUME=${LLAMA_RESUME:-1} LLAMA_RESUME_DIR=${LLAMA_RESUME_DIR-$PREFIX/state}
+else
+  export LLAMA_RESUME=0 LLAMA_RESUME_DIR=
+fi
+[ "$FL128" = 1 ] && export GGML_PTQ1_FL128=${GGML_PTQ1_FL128:-1} GGML_PTQ1_K4=${GGML_PTQ1_K4:-2}
+# Without AVX-512 VNNI the engine runs on the fork's own kernel, and speculation is slower than plain decoding there
+# (measured 2026-11-12, AVX2 kernel: 1.2 vs 1.7 tok/s). With VNNI but no VBMI it still helps (7.8 vs 6.6), so it stays on.
+if [ "$SPEC" = 1 ] && [ "$MULTI" -lt 2 ] && [ "$SPEC_FORCE" = 0 ]; then
+  case " $(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2) " in
+    *" avx512_vnni "*) ;;
+    *) echo "note: this CPU has no AVX-512 VNNI: speculation off (it is slower than plain decoding here); --spec forces it" >&2
+       SPEC=0 ;;
+  esac
+fi
+[ "$KV8" = 1 ] && args+=(-ctk q8_K -ctv q8_K)   # needs patch 0008 (attn-fast.inc); f16 KV is the exact default
+if [ "$SPEC" = 1 ] && [ "$MULTI" -lt 2 ] && [ "$SPEC_FORCE" = 0 ] && \
+   { [ "$CTX" -gt 8192 ] || { [ "$CTX" -gt 4096 ] && [ "$KV8" = 0 ]; }; } && \
+   [ "$MEM_KB" -lt 12000000 ]; then
+  # with patch 0008 the verify batch is fast at any depth (16 GB: MTP 1.6-1.7x plain at 4k-32k), but on 8 GB the draft
+  # state + f16 KV leave < 0.1 GB free above 4k and page reclaim makes MTP slower than plain decode (8k: 6.5 vs 7.5 tok/s);
+  # with --kv8 the int8 KV leaves room and MTP wins again at 8k (10.9 tok/s); at 16k MTP does not fit 8 GB either way.
+  # (measured 2026-11-10 on an 8 vCPU / 8 GB Ice Lake box)
+  echo "note: --ctx $CTX on < 12 GB RAM: speculation off (it is slower than plain decode here or does not fit: memory);" >&2
+  echo "      up to --ctx 8192, --kv8 (int8 attention cache) keeps it on and helps on long prompts; --spec forces it" >&2
+  SPEC=0
+fi
+if [ "$SPEC" = 1 ]; then
+  mem_kb=$MEM_KB
+  if [ "$ADAPT" = 1 ]; then
+    # each draft position keeps one recurrent-state snapshot plane (~0.14 GB per depth step at 48 GDN layers), so the
+    # depth range is 0..3 on < 12 GB RAM unless --spec-depth says otherwise; the server's "no draft this step" path is depth 0
+    [ -z "$DEPTH" ] && { [ "$mem_kb" -ge 12000000 ] && DEPTH=5 || DEPTH=3; }
+    export LLAMA_SPEC_ADAPT=${LLAMA_SPEC_ADAPT:-1}
+    args+=(--spec-type draft-mtp --spec-draft-n-max "$DEPTH"); SPECNAME="adaptive"
+  else
+    args+=(--spec-type draft-mtp --spec-draft-n-max "${DEPTH:-3}"); SPECNAME="on (lower-memory mode)"
+  fi
+  if [ "$X1" = 1 ] && [ "$CTX" -gt 4096 ] && [ "$mem_kb" -lt 12000000 ]; then
+    # X1 holds ~0.2 GB more (draft panels + 65k head); at 4k context an 8 GB box keeps ~0.13 GB free, at 8k it would not
+    echo "note: --ctx $CTX on < 12 GB RAM: using the lower-memory speculation mode (same outputs, a little slower)" >&2
+    X1=0
+  fi
+  if [ "$X1" = 1 ]; then
+    # X1: faster speculation cycle + a 65k-token draft head; the draft head falls back to the full vocabulary while
+    # more than 20 % of the recent tokens are outside the 65k list (non-Latin text). Outputs = MTP-3 without X1.
+    IDS=$HERE/data/x1-draft-ids.txt
+    [ -f "$IDS" ] || IDS=$PREFIX/x1-draft-ids.txt
+    if [ -f "$IDS" ]; then
+      export GGML_X1=${GGML_X1:-109} LLAMA_ARG_REPACK=${LLAMA_ARG_REPACK:-0} X1_MTP_ANCHOR_ONLY=${X1_MTP_ANCHOR_ONLY:-1} \
+             X1_DRAFT_VOCAB=${X1_DRAFT_VOCAB:-65536} X1_DRAFT_IDS=${X1_DRAFT_IDS:-$IDS} X1_Q6_AS_Q4=${X1_Q6_AS_Q4:-1} \
+             X1_DRAFT_FALLBACK=${X1_DRAFT_FALLBACK:-0.2}
+      [ "$ADAPT" = 1 ] && SPECNAME="adaptive" || SPECNAME="on"
+    else
+      echo "note: a data file in data/ was not found; using the lower-memory speculation mode (same outputs)" >&2
+    fi
+  fi
+fi
+export LD_LIBRARY_PATH="$BIN${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+SHOW=$HOST; [ "$HOST" = 0.0.0.0 ] && SHOW=127.0.0.1
+[ "$WEBUI" = 1 ] && echo "chat: open http://$SHOW:$PORT in a browser (the page answers once the model has loaded)" >&2
+echo "serving on http://$HOST:$PORT/v1 (speculation: $SPECNAME, streams: $NP, ctx: $CTX_TOTAL, thinking: $THINK, resume: $([ "$RESUME" = 1 ] && [ "$CKPT" -gt 0 ] && echo on || echo off))" >&2
+exec "$BIN/llama-server" "${args[@]}" "${EXTRA[@]}"

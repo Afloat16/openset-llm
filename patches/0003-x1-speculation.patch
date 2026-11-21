@@ -1,0 +1,531 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 2166fe92..64f68138 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3135,6 +3135,7 @@ static int ggml_cpu_try_fuse_ops(
+ }
+ 
+ int ggml_k6_node(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params);   // K6 (ops.cpp)
++int ggml_x1_node(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params);   // X1 (ops.cpp), falls through to K6
+ 
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+@@ -3179,7 +3180,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         // K6: -1 = not handled; 0 = folded into a later op (nothing to compute, nothing to sync); r > 0 = computed r nodes
+-        const int k6r = ggml_k6_node(cgraph, node_n, &params);
++        const int k6r = ggml_x1_node(cgraph, node_n, &params);
+         if (k6r == 0) {
+             continue;
+         }
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 829ac431..449d40bc 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12835,3 +12835,319 @@ void ggml_compute_forward_lightning_indexer(
+         }
+     }
+ }
++
++
++// ---- X1: speculation-cycle fusions, GGML_X1 bitmask, default 0 = off ----
++// AVX-512 VNNI builds only; any other build (AVX2, no-VNNI, ARM) forwards every node to K6 unchanged.
++#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
++#include <immintrin.h>
++static int x1_mode_v = -1;
++static inline int x1_mode(void) {
++    if (x1_mode_v < 0) { const char * e = getenv("GGML_X1"); x1_mode_v = e ? atoi(e) : 0; }
++    return x1_mode_v;
++}
++#include "ggml-backend.h"
++#include "x1-q4k.inc"
++static long x1_dbg_n[4];
++static long x1_why[32];
++static void x1_dbg_dump(void) { fprintf(stderr, "X1: gdn_rows_inplace %ld, set_rows_skipped %ld, conv_steps %ld; no-match reasons:", x1_dbg_n[0], x1_dbg_n[1], x1_dbg_n[2]); for (int i = 0; i < 32; ++i) if (x1_why[i]) fprintf(stderr, " %d:%ld", i, x1_why[i]); fprintf(stderr, "\n"); }
++
++static int x1_index_of(const ggml_cgraph * cg, const ggml_tensor * t, int lo, int hi) {
++    for (int j = lo < 0 ? 0 : lo; j < hi && j < cg->n_nodes; ++j) if (cg->nodes[j] == t) return j;
++    return -1;
++}
++
++// bit 1: a rows-mode GDN (src[6] = row index, K > 1) whose snapshot region is consumed only by one SET_ROWS into an f32
++// cache with contiguous rows: m.sr = that SET_ROWS, m.idx = its row index tensor, m.cache = destination base
++struct x1_gdnrows_m { const ggml_tensor * sr; const ggml_tensor * idx; char * cache; size_t cache_nb1; int64_t n_written; };
++static bool x1_gdnrows_match(const ggml_cgraph * cg, int i, x1_gdnrows_m * m) {
++    const ggml_tensor * d = cg->nodes[i];
++    if (d->op != GGML_OP_GATED_DELTA_NET || !d->src[6] || d->type != GGML_TYPE_F32) { x1_why[1]++; return false; }
++    const int64_t K = ggml_get_op_params_i32(d, 0);
++    const ggml_tensor * v = d->src[2];
++    const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
++    if (K <= 1 || d->src[3]->ne[0] != 1) { x1_why[2]++; return false; }                         // scalar gate only (the model's case)
++    const int64_t D = S_v * S_v * H, attn = S_v * H * n_tokens * n_seqs;
++    const int64_t nw = std::min<int64_t>(n_tokens, K);
++    const ggml_tensor * sr = nullptr;
++    for (int j = i + 1; j < cg->n_nodes && j <= i + 8; ++j) {
++        const ggml_tensor * n = cg->nodes[j];
++        if (n->op == GGML_OP_SET_ROWS && k6_base(n->src[0]) == d) { sr = n; break; }
++        if (!ggml_op_is_empty(n->op)) { x1_why[3]++; return false; }                            // only views between the op and its SET_ROWS
++    }
++    if (!sr) { x1_why[4]++; return false; }
++    const ggml_tensor * sn = sr->src[0], * idx = sr->src[1], * cache = sr->src[2];
++    if (sn->type != GGML_TYPE_F32 || sn->view_src != d || sn->view_offs != (size_t) attn * sizeof(float) || sn->ne[0] != D ||
++        sn->ne[1] != nw * n_seqs || sn->ne[2] != 1 || sn->ne[3] != 1 || sn->nb[1] != (size_t) D * sizeof(float)) { x1_why[5]++; return false; }
++    if (sr->type != GGML_TYPE_F32 || !cache || cache->type != GGML_TYPE_F32 || cache->ne[0] != D || cache->nb[0] != sizeof(float) ||
++        sr->ne[2] != 1 || sr->ne[3] != 1 || !sr->data || !idx->data) { x1_why[6]++; return false; }
++    if (idx->type != GGML_TYPE_I64 && idx->type != GGML_TYPE_I32) { x1_why[7]++; return false; }
++    if (idx->ne[0] != nw * n_seqs || idx->ne[1] != 1) { x1_why[8]++; return false; }
++    for (int64_t r = 0; r < nw * n_seqs; ++r) {
++        const int64_t i1 = idx->type == GGML_TYPE_I64 ? ((const int64_t *) idx->data)[r] : ((const int32_t *) idx->data)[r];
++        if (i1 < 0 || i1 >= sr->ne[1]) { x1_why[9]++; return false; }
++    }
++    // nothing else in the next 64 nodes may read the snapshot region of d
++    for (int j = i + 1; j < cg->n_nodes && j <= i + 64; ++j) {
++        const ggml_tensor * n = cg->nodes[j];
++        if (n == sr || ggml_op_is_empty(n->op)) continue;          // views carry d as src[0] but read nothing
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            const ggml_tensor * t = n->src[s];
++            if (!t || t == sn) continue;
++            if (t == d) { x1_why[10]++; return false; }
++            if (t->view_src == d && t->view_offs + ggml_nbytes(t) > (size_t) attn * sizeof(float)) { x1_why[11]++; return false; }
++        }
++    }
++    m->sr = sr; m->idx = idx; m->cache = (char *) sr->data; m->cache_nb1 = sr->nb[1]; m->n_written = nw;
++    return true;
++}
++
++// 64-byte aligned streaming copy (same bytes as memcpy; the snapshots are not read again in this graph)
++static inline void x1_stream_copy(float * dst, const float * src, int64_t n) {
++#if defined(__AVX512F__)
++    if (!(x1_mode() & 2) && (((uintptr_t) dst) & 63) == 0 && (n & 15) == 0) {
++        for (int64_t i = 0; i < n; i += 16) _mm512_stream_ps(dst + i, _mm512_loadu_ps(src + i));
++        return;
++    }
++#endif
++    memcpy(dst, src, n * sizeof(float));
++}
++
++// the rows-mode GDN for heads [ir0, ir1): ggml_compute_forward_gated_delta_net_one_chunk's scalar-gate path, the same vec
++// calls in the same order, with each snapshot copied to its cache row instead of the op's output
++static void x1_gdn_rows_chunk(const ggml_compute_params * params, ggml_tensor * dst, const x1_gdnrows_m * m, int64_t ir0, int64_t ir1) {
++    const bool rowfused = (x1_mode() & 32) != 0;
++    const ggml_tensor * src_q = dst->src[0], * src_k = dst->src[1], * src_v = dst->src[2], * src_g = dst->src[3], * src_beta = dst->src[4], * src_state = dst->src[5];
++    const bool raw_gates = ggml_get_op_params_i32(dst, 1) != 0;
++    const float * raw_dt_bias = raw_gates ? (const float *) dst->src[7]->data : nullptr;
++    const float * raw_a = raw_gates ? (const float *) dst->src[8]->data : nullptr;
++    const int64_t S_v = src_v->ne[0], H = src_v->ne[1], n_tokens = src_v->ne[2], n_seqs = src_v->ne[3];
++    const int64_t K = ggml_get_op_params_i32(dst, 0);
++    const int32_t * state_rows_idx = (const int32_t *) dst->src[6]->data;
++    const int64_t state_row_size = (int64_t) (src_state->nb[1] / sizeof(float));
++    const int64_t per_thread = S_v + S_v * S_v;
++    float * delta = (float *) params->wdata + params->ith * per_thread + CACHE_LINE_SIZE_F32;
++    float * state_work = delta + S_v;
++    float * attn_out_base = (float *) dst->data;
++    const float * state_in_base = (const float *) src_state->data;
++    const int64_t rq3 = src_v->ne[3] / src_q->ne[3], rk3 = src_v->ne[3] / src_k->ne[3];
++    const float scale = 1.0f / sqrtf((float) S_v);
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t iv1 = ir % H, iv3 = ir / H;
++        const int64_t iq1 = iv1 % src_q->ne[1], ik1 = iv1 % src_k->ne[1], iq3 = iv3 / rq3, ik3 = iv3 / rk3;
++        float * s_out = state_work;
++        const float * s_in = state_in_base + (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v;
++        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
++        float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
++        for (int64_t t = 0; t < n_tokens; t++) {
++            const float * q_d = (const float *) ((const char *) src_q->data + iq3 * src_q->nb[3] + t * src_q->nb[2] + iq1 * src_q->nb[1]);
++            const float * k_d = (const float *) ((const char *) src_k->data + ik3 * src_k->nb[3] + t * src_k->nb[2] + ik1 * src_k->nb[1]);
++            const float * v_d = (const float *) ((const char *) src_v->data + iv3 * src_v->nb[3] + t * src_v->nb[2] + iv1 * src_v->nb[1]);
++            float beta_val = *(const float *) ((const char *) src_beta->data + iv3 * src_beta->nb[3] + t * src_beta->nb[2] + iv1 * src_beta->nb[1]);
++            const float * g_d = (const float *) ((const char *) src_g->data + iv3 * src_g->nb[3] + t * src_g->nb[2] + iv1 * src_g->nb[1]);
++            float g0 = g_d[0];
++            if (raw_gates) {
++                beta_val = 1.0f / (1.0f + expf(-beta_val));
++                const float x = g0 + raw_dt_bias[iv1];
++                g0 = raw_a[iv1] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
++            }
++            const float eg = expf(g0);
++            if (rowfused && S_v == 128) {   // bit 32, inlined: the same intrinsics as ggml_vec_{scale,dot,mad}_f32 (AVX-512), two rows at a time
++                const __m512 vg = _mm512_set1_ps(eg);
++                const __m512 k0 = _mm512_loadu_ps(k_d), k1 = _mm512_loadu_ps(k_d + 16), k2 = _mm512_loadu_ps(k_d + 32), k3 = _mm512_loadu_ps(k_d + 48);
++                const __m512 k4 = _mm512_loadu_ps(k_d + 64), k5 = _mm512_loadu_ps(k_d + 80), k6 = _mm512_loadu_ps(k_d + 96), k7 = _mm512_loadu_ps(k_d + 112);
++                const __m512 q0 = _mm512_loadu_ps(q_d), q1 = _mm512_loadu_ps(q_d + 16), q2 = _mm512_loadu_ps(q_d + 32), q3 = _mm512_loadu_ps(q_d + 48);
++                const __m512 q4 = _mm512_loadu_ps(q_d + 64), q5 = _mm512_loadu_ps(q_d + 80), q6 = _mm512_loadu_ps(q_d + 96), q7 = _mm512_loadu_ps(q_d + 112);
++                for (int64_t j = 0; j < S_v; ++j) {
++                    float * row = &s_out[j * S_v];
++                    __m512 r[8];
++                    for (int u = 0; u < 8; ++u) r[u] = _mm512_mul_ps(_mm512_loadu_ps(row + 16 * u), vg);          // ggml_vec_scale_f32
++                    // ggml_vec_dot_f32 (n = 128, STEP 64, 4 accumulators): acc[u] over i = 0, 64; then x0+x2, x1+x3, x0+x1, reduce
++                    __m512 a0 = _mm512_fmadd_ps(r[0], k0, _mm512_setzero_ps()), a1 = _mm512_fmadd_ps(r[1], k1, _mm512_setzero_ps());
++                    __m512 a2 = _mm512_fmadd_ps(r[2], k2, _mm512_setzero_ps()), a3 = _mm512_fmadd_ps(r[3], k3, _mm512_setzero_ps());
++                    a0 = _mm512_fmadd_ps(r[4], k4, a0); a1 = _mm512_fmadd_ps(r[5], k5, a1); a2 = _mm512_fmadd_ps(r[6], k6, a2); a3 = _mm512_fmadd_ps(r[7], k7, a3);
++                    a0 = _mm512_add_ps(a0, a2); a1 = _mm512_add_ps(a1, a3); a0 = _mm512_add_ps(a0, a1);
++                    const float sum = _mm512_reduce_add_ps(a0);
++                    delta[j] = (v_d[j] - sum) * beta_val;
++                    const __m512 vd = _mm512_set1_ps(delta[j]);
++                    r[0] = _mm512_fmadd_ps(k0, vd, r[0]); r[1] = _mm512_fmadd_ps(k1, vd, r[1]); r[2] = _mm512_fmadd_ps(k2, vd, r[2]); r[3] = _mm512_fmadd_ps(k3, vd, r[3]);
++                    r[4] = _mm512_fmadd_ps(k4, vd, r[4]); r[5] = _mm512_fmadd_ps(k5, vd, r[5]); r[6] = _mm512_fmadd_ps(k6, vd, r[6]); r[7] = _mm512_fmadd_ps(k7, vd, r[7]);
++                    for (int u = 0; u < 8; ++u) _mm512_storeu_ps(row + 16 * u, r[u]);                             // ggml_vec_mad_f32
++                    __m512 b0 = _mm512_fmadd_ps(r[0], q0, _mm512_setzero_ps()), b1 = _mm512_fmadd_ps(r[1], q1, _mm512_setzero_ps());
++                    __m512 b2 = _mm512_fmadd_ps(r[2], q2, _mm512_setzero_ps()), b3 = _mm512_fmadd_ps(r[3], q3, _mm512_setzero_ps());
++                    b0 = _mm512_fmadd_ps(r[4], q4, b0); b1 = _mm512_fmadd_ps(r[5], q5, b1); b2 = _mm512_fmadd_ps(r[6], q6, b2); b3 = _mm512_fmadd_ps(r[7], q7, b3);
++                    b0 = _mm512_add_ps(b0, b2); b1 = _mm512_add_ps(b1, b3); b0 = _mm512_add_ps(b0, b1);
++                    attn_data[j] = _mm512_reduce_add_ps(b0) * scale;
++                }
++            } else if (rowfused) {   // bit 32: one pass per row (row j stays in L1); every step is row-local, so the values are the same
++                for (int64_t j = 0; j < S_v; ++j) {
++                    float * row = &s_out[j * S_v];
++                    ggml_vec_scale_f32(S_v, row, eg);
++                    float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, row, 0, k_d, 0, 1);
++                    delta[j] = (v_d[j] - sum) * beta_val;
++                    ggml_vec_mad_f32(S_v, row, k_d, delta[j]);
++                    float sq = 0.0f; ggml_vec_dot_f32(S_v, &sq, 0, row, 0, q_d, 0, 1);
++                    attn_data[j] = sq * scale;
++                }
++            } else {
++            ggml_vec_scale_f32(S_v * S_v, s_out, eg);
++            for (int64_t j = 0; j < S_v; ++j) { float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1); delta[j] = (v_d[j] - sum) * beta_val; }
++            for (int64_t j = 0; j < S_v; ++j) ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
++            for (int64_t j = 0; j < S_v; ++j) { float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1); attn_data[j] = sum * scale; }
++            }
++            attn_data += S_v * H;
++            const int64_t target_slot = n_tokens - 1 - t;
++            if (target_slot >= 0 && target_slot < K) {
++                const int64_t r = target_slot * n_seqs + iv3;     // snapshot row in the stock op's output -> SET_ROWS row r
++                const int64_t i1 = m->idx->type == GGML_TYPE_I64 ? ((const int64_t *) m->idx->data)[r] : ((const int32_t *) m->idx->data)[r];
++                x1_stream_copy((float *) (m->cache + i1 * m->cache_nb1) + iv1 * S_v * S_v, s_out, S_v * S_v);
++            }
++        }
++    }
++#if defined(__AVX512F__)
++    _mm_sfence();
++#endif
++}
++
++static void x1_gdn_rows(const ggml_compute_params * params, ggml_tensor * dst, const x1_gdnrows_m * m) {
++    const int64_t nr = dst->src[2]->ne[1] * dst->src[2]->ne[3];
++    const int nth = params->nth, ith = params->ith;
++    const int64_t dr = (nr + nth - 1) / nth;
++    const int64_t ir0 = std::min<int64_t>(dr * ith, nr), ir1 = std::min<int64_t>(ir0 + dr, nr);
++    x1_gdn_rows_chunk(params, dst, m, ir0, ir1);
++}
++
++// bit 4: PAD with only right/row padding of a contiguous f32 tensor (the backend sampler's logits pad: 248,320 floats,
++// stock = one element loop per row, 2 rows -> 2 of 8 threads): a flat copy of the source + zeros, split over all threads
++static bool x1_pad(const ggml_compute_params * params, const ggml_tensor * n) {
++    const ggml_tensor * s = n->src[0];
++    if (n->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(n) || !ggml_is_contiguous(s)) return false;
++    for (int i = 0; i < 9; ++i) if (i != 3 && ggml_get_op_params_i32(n, i) != 0) return false;   // only rp1 (extra rows)
++    if (n->ne[0] != s->ne[0] || n->ne[2] != 1 || n->ne[3] != 1 || s->ne[2] != 1 || s->ne[3] != 1) return false;
++    const int64_t ns = ggml_nelements(s), nd = ggml_nelements(n);
++    const int64_t per = ((nd + params->nth - 1) / params->nth + 15) & ~(int64_t) 15;
++    const int64_t a = std::min<int64_t>(nd, per * params->ith), b = std::min<int64_t>(nd, a + per);
++    float * d = (float *) n->data; const float * x = (const float *) s->data;
++    const int64_t c1 = std::min<int64_t>(b, ns);
++    if (c1 > a) memcpy(d + a, x + a, (c1 - a) * sizeof(float));
++    const int64_t z0 = std::max<int64_t>(a, ns);
++    if (b > z0) memset(d + z0, 0, (b - z0) * sizeof(float));
++    return true;
++}
++
++// bit 8: the rows-mode conv-state step. conv_input = CONCAT(conv state [3, C], qkv^T [T, C]) along dim 0 (stock: an
++// element loop with a transposed read, ~90 us per layer), and the K CPYs that store views of conv_input into the conv-state
++// planes. Here one pass per thread over a channel range: the concat, then (the same thread, same channels) the K CPYs.
++// A thread's channels never overlap another's, and its reads of the state row precede its writes, so an aliased plane
++// (the row being read is also a CPY destination) is safe. Same values, pure copies.
++#define X1_CONV_MAXCPY 8
++struct x1_conv_m { const ggml_tensor * cat; const ggml_tensor * cpy[X1_CONV_MAXCPY]; int ncpy; };
++static bool x1_conv_match(const ggml_cgraph * cg, int i, x1_conv_m * m) {
++    const ggml_tensor * n = cg->nodes[i];
++    if (n->op != GGML_OP_CONCAT || ggml_get_op_params_i32(n, 0) != 0 || n->type != GGML_TYPE_F32) return false;
++    const ggml_tensor * a = n->src[0], * b = n->src[1];
++    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(n)) return false;
++    if (n->ne[2] != 1 || n->ne[3] != 1 || a->ne[1] != n->ne[1] || b->ne[1] != n->ne[1] || a->ne[2] != 1 || b->ne[2] != 1 ||
++        a->ne[3] != 1 || b->ne[3] != 1 || a->ne[0] + b->ne[0] != n->ne[0] || n->ne[0] > 64 || n->ne[1] < 1024) return false;
++    m->cat = n; m->ncpy = 0;
++    for (int j = i + 1; j < cg->n_nodes && j <= i + 24; ++j) {
++        const ggml_tensor * t = cg->nodes[j];
++        if (t->op != GGML_OP_CPY) continue;
++        const ggml_tensor * s = t->src[0], * d = t->src[1];
++        if (s->view_src != n || s->type != GGML_TYPE_F32 || t->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32) continue;
++        if (s->ne[1] != n->ne[1] || s->ne[2] != 1 || s->ne[3] != 1 || s->nb[0] != sizeof(float) || s->nb[1] != n->nb[1]) return false;
++        if (!ggml_is_contiguous(t) || ggml_nelements(t) != ggml_nelements(s)) return false;
++        if (s->view_offs % sizeof(float) != 0 || s->view_offs / sizeof(float) + s->ne[0] > (size_t) n->ne[0]) return false;
++        if (m->ncpy == X1_CONV_MAXCPY) return false;
++        m->cpy[m->ncpy++] = t;
++    }
++    return m->ncpy >= 2;                                                      // rows mode (K snapshots); plain decode stays with K6
++}
++static void x1_conv_step(const ggml_compute_params * params, const x1_conv_m * m) {
++    const ggml_tensor * n = m->cat, * a = n->src[0], * b = n->src[1];
++    const int64_t C = n->ne[1], na = a->ne[0], nb = b->ne[0], W = n->ne[0];
++    const int64_t per = (C + params->nth - 1) / params->nth;
++    const int64_t c0 = std::min<int64_t>(C, per * params->ith), c1 = std::min<int64_t>(C, c0 + per);
++    float * out = (float *) n->data;
++    for (int64_t c = c0; c < c1; ++c) {
++        float * o = out + c * W;
++        const char * ar = (const char *) a->data + c * a->nb[1];
++        for (int64_t k = 0; k < na; ++k) o[k] = *(const float *) (ar + k * a->nb[0]);
++        const char * br = (const char *) b->data + c * b->nb[1];
++        for (int64_t k = 0; k < nb; ++k) o[na + k] = *(const float *) (br + k * b->nb[0]);
++    }
++    for (int q = 0; q < m->ncpy; ++q) {
++        const ggml_tensor * t = m->cpy[q], * s = t->src[0];
++        const int64_t off = s->view_offs / sizeof(float), w = s->ne[0];
++        float * d = (float *) t->data;
++        for (int64_t c = c0; c < c1; ++c) memcpy(d + c * w, out + c * W + off, w * sizeof(float));
++    }
++}
++
++// bit 4 (also): FILL of a contiguous f32 tensor as one flat range per thread (the draft head's -inf vocab row is
++// [1, 248320]: stock = 248,320 one-element rows)
++static bool x1_fill(const ggml_compute_params * params, const ggml_tensor * n) {
++    if (n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n)) return false;
++    const float v = ggml_get_op_params_f32(n, 0);
++    const int64_t nd = ggml_nelements(n);
++    const int64_t per = ((nd + params->nth - 1) / params->nth + 15) & ~(int64_t) 15;
++    const int64_t a = std::min<int64_t>(nd, per * params->ith), b = std::min<int64_t>(nd, a + per);
++    float * d = (float *) n->data;
++    for (int64_t i = a; i < b; ++i) d[i] = v;
++    return true;
++}
++
++extern "C" int ggml_k6_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params);
++
++// -1 = not handled; 0 = folded into an earlier op (skip, no barrier); r > 0 = computed r nodes (K6 convention)
++extern "C" int ggml_x1_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params) {
++    const int mode = x1_mode();
++    if (mode && !params->use_ref) {
++        static int dbg = -1;
++        if (dbg < 0 && params->ith == 0) { dbg = getenv("GGML_X1_DBG") ? 1 : 0; if (dbg) atexit(x1_dbg_dump); }
++        const ggml_tensor * n = cg->nodes[i];
++        if ((mode & 1) && n->op == GGML_OP_GATED_DELTA_NET) {
++            x1_gdnrows_m m;
++            if (x1_gdnrows_match(cg, i, &m)) {
++                x1_gdn_rows(params, (ggml_tensor *) n, &m);
++                if (params->ith == 0 && dbg > 0) ++x1_dbg_n[0];
++                return 1;
++            }
++        } else if ((mode & 8) && n->op == GGML_OP_CONCAT) {
++            x1_conv_m m;
++            if (x1_conv_match(cg, i, &m)) { x1_conv_step(params, &m); if (params->ith == 0 && dbg > 0) ++x1_dbg_n[2]; return 1; }
++        } else if ((mode & 8) && n->op == GGML_OP_CPY && n->src[0]->view_src && n->src[0]->view_src->op == GGML_OP_CONCAT) {
++            const int jc = x1_index_of(cg, n->src[0]->view_src, i - 24, i);
++            x1_conv_m m;
++            if (jc >= 0 && x1_conv_match(cg, jc, &m)) for (int q = 0; q < m.ncpy; ++q) if (m.cpy[q] == n) return 0;
++        } else if ((mode & 64) && n->op == GGML_OP_MUL_MAT && x1q4k_applies(n)) {
++            x1q4k_mul_mat(params, n);
++            return 1;
++        } else if ((mode & 64) && n->op == GGML_OP_MUL_MAT && x1q6k_applies(n)) {
++            x1q6k_mul_mat(params, n);
++            return 1;
++        } else if ((mode & 4) && n->op == GGML_OP_PAD) {
++            if (x1_pad(params, n)) return 1;
++        } else if ((mode & 4) && n->op == GGML_OP_FILL) {
++            if (x1_fill(params, n)) return 1;
++        } else if ((mode & 1) && n->op == GGML_OP_SET_ROWS) {
++            const ggml_tensor * b = k6_base(n->src[0]);
++            if (b && b->op == GGML_OP_GATED_DELTA_NET) {
++                const int jd = x1_index_of(cg, b, i - 8, i);
++                x1_gdnrows_m m;
++                if (jd >= 0 && x1_gdnrows_match(cg, jd, &m) && m.sr == n) {
++                    if (params->ith == 0 && dbg > 0) ++x1_dbg_n[1];
++                    return 0;
++                }
++            }
++        }
++    }
++    return ggml_k6_node(cg, i, params);
++}
++#else
++extern "C" int ggml_k6_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params);
++extern "C" int ggml_x1_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params) {
++    return ggml_k6_node(cg, i, params);
++}
++#endif
++// ---- end X1 ----
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3a375721..53d234d4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1720,6 +1720,8 @@ bool llama_context::set_adapter_cvec(
+     return res;
+ }
+ 
++extern "C" int llama_x1_draft_full(void);   // X1 (src/models/qwen35.cpp)
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -1741,7 +1743,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     const bool chain_stats = chain_stats_on && cparams.mtp_chain_n > 0;
+     const int64_t t_cs0 = chain_stats ? ggml_time_us() : 0;
+ 
+-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
++    // X1 fallback: the MTP draft head (65k list or full vocab) is chosen at graph build, so a switch forces a rebuild
++    const int x1_full_now = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? llama_x1_draft_full() : -1;
++    static int x1_full_built = -1;
++    const bool x1_stale = x1_full_now >= 0 && x1_full_now != x1_full_built;
++    if (x1_full_now >= 0) {
++        x1_full_built = x1_full_now;
++    }
++
++    if (!graph_reuse_disable && !x1_stale && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 91479865..08e7db1a 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -690,6 +690,58 @@ public:
+     const uint32_t n_pos_per_embd;
+ };
+ 
++
++// ---- X1 draft head ----
++#include "ggml-cpu.h"
++#include <fstream>
++#include <algorithm>
++static ggml_tensor * x1_dh = nullptr, * x1_dh_ids = nullptr;
++// fallback (X1_DRAFT_FALLBACK, read by the server): token -> in the draft list, and the full-vocab switch the server sets
++// per draft call when recent text is mostly outside the list. The switch only picks which head drafts; verify decides.
++static std::vector<char> x1_dh_member;
++static int x1_dh_full_v = 0;
++extern "C" LLAMA_API int  llama_x1_draft_list_ready(void)     { return x1_dh != nullptr; }
++extern "C" LLAMA_API int  llama_x1_draft_list_has(int32_t t)  { return t >= 0 && (size_t) t < x1_dh_member.size() && x1_dh_member[t]; }
++extern "C" LLAMA_API void llama_x1_draft_set_full(int full)   { x1_dh_full_v = full ? 1 : 0; }
++extern "C" LLAMA_API int  llama_x1_draft_full(void)           { return x1_dh_full_v; }
++static void x1_dh_init(const ggml_tensor * out, const llama_hadamard_rotations * rot) {
++    static bool done = false;
++    if (done) return;
++    const char * e = getenv("X1_DRAFT_VOCAB");
++    if (!e || atoll(e) <= 0) { done = true; return; }
++    // the model can be built without data first (memory fitting / reserve): only copy from real, host-resident weights
++    if (!out || !out->data || !out->buffer || !ggml_backend_buffer_is_host(out->buffer) || ggml_backend_buffer_get_size(out->buffer) == 0) return;
++    done = true;
++    const int64_t n_voc = out->ne[1];
++    const int64_t N = std::min<int64_t>(atoll(e), n_voc);
++    std::vector<int32_t> ids;
++    if (const char * f = getenv("X1_DRAFT_IDS")) {
++        std::ifstream in(f); std::vector<char> seen(n_voc, 0); long long t;
++        while ((int64_t) ids.size() < N && in >> t) if (t >= 0 && t < n_voc && !seen[t]) { seen[t] = 1; ids.push_back((int32_t) t); }
++        for (int64_t t2 = 0; (int64_t) ids.size() < N && t2 < n_voc; ++t2) if (!seen[t2]) { seen[t2] = 1; ids.push_back((int32_t) t2); }
++        std::sort(ids.begin(), ids.end());
++    } else {
++        for (int64_t t = 0; t < N; ++t) ids.push_back((int32_t) t);
++    }
++    ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++    x1_dh     = ggml_new_tensor_2d(ctx, out->type, out->ne[0], N);
++    x1_dh_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
++    ggml_set_name(x1_dh, "x1_draft_head");
++    if (!ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type())) { x1_dh = x1_dh_ids = nullptr; return; }
++    for (int64_t i = 0; i < N; ++i) memcpy((char *) x1_dh->data + i * x1_dh->nb[1], (const char *) out->data + (int64_t) ids[i] * out->nb[1], out->nb[1]);
++    memcpy(x1_dh_ids->data, ids.data(), N * sizeof(int32_t));
++    x1_dh_member.assign(n_voc, 0);
++    for (const int32_t t : ids) x1_dh_member[t] = 1;
++    if (rot) {   // the full head's input transform applies to its rows unchanged
++        auto * r = const_cast<llama_hadamard_rotations *>(rot);
++        auto it = r->find(out);
++        if (it != r->end()) { const auto tr = it->second; (*r)[x1_dh] = tr; }
++    }
++    LLAMA_LOG_INFO("X1: draft head over %lld of %lld tokens (%s), %.1f MiB\n", (long long) N, (long long) n_voc,
++                   getenv("X1_DRAFT_IDS") ? "id file" : "ids 0..N-1", ggml_nbytes(x1_dh) / 1048576.0);
++}
++
+ // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
+ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
+     : llm_graph_context(params) {
+@@ -876,6 +928,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     cb(cur, "mtp_attn_pregate", il);
+ 
+     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
++    static const bool x1_anchor_only = getenv("X1_MTP_ANCHOR_ONLY") && atoi(getenv("X1_MTP_ANCHOR_ONLY"));
++    const bool x1_cut = x1_anchor_only && inp_out_ids && cparams.embeddings_nextn_masked && n_outputs < n_tokens;
++    if (x1_cut) {
++        cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
++        inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
++    }
+     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
+     cb(cur, "mtp_attn_out", il);
+ 
+@@ -910,7 +968,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     // Matters as soon as an MTP batch has more tokens than outputs, e.g. catch-up rows decoded
+     // together with the first draft row.
+     if (cparams.embeddings_nextn_masked) {
+-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        if (!x1_cut) cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+         res->t_h_nextn = cur;
+     } else {
+         res->t_h_nextn = cur;
+@@ -922,7 +980,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+     static const bool draft_head_off = getenv("LLAMA_MTP_DRAFT_HEAD_OFF") != nullptr;
+-    if (layer.nextn.draft_head && layer.nextn.draft_head_ids && !layer.nextn.shared_head_head && !draft_head_off) {
++    if (!layer.nextn.shared_head_head) x1_dh_init(head_w, hadamard_rotations);
++    if (x1_dh && !layer.nextn.shared_head_head && !x1_dh_full_v) {
++        // X1: logits of the N copied rows (same rotation + scale as the full head), scattered into a -inf vocab row
++        const int64_t n_k   = x1_dh->ne[1];
++        const int64_t n_out = cur->ne[1];
++        const int64_t n_voc = head_w->ne[1];
++        ggml_tensor * lk   = build_lora_mm(x1_dh, cur, head_s);                                      // [K, n_out]
++        ggml_tensor * full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_voc, n_out);
++        full = ggml_fill(ctx0, full, -INFINITY);
++        full = ggml_set_rows(ctx0, full, ggml_reshape_3d(ctx0, lk, 1, n_k, n_out), ggml_reshape_2d(ctx0, x1_dh_ids, n_k, 1));
++        cur = ggml_reshape_2d(ctx0, full, n_voc, n_out);
++    } else if (layer.nextn.draft_head && layer.nextn.draft_head_ids && !layer.nextn.shared_head_head && !draft_head_off) {
+         // ARC-LAB: logits for the top-K frequent tokens only, scattered into a full-vocab row of -inf; the target
+         // model still verifies every draft, so this changes only which tokens can be drafted, not the output
+         const int64_t n_k   = layer.nextn.draft_head->ne[1];
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d02038cb..0d9b40f8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,5 @@
+ #include "server-context.h"
++
+ #include "server-chat.h"
+ #include "server-common.h"
+ #include "server-http.h"
+@@ -34,8 +35,14 @@
+ #   define NOMINMAX
+ #endif
+ #include <windows.h>
++
+ #endif
+ 
++// X1 draft list (src/models/qwen35.cpp, libllama)
++extern "C" int  llama_x1_draft_list_ready(void);
++extern "C" int  llama_x1_draft_list_has(int32_t t);
++extern "C" void llama_x1_draft_set_full(int full);
++
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+@@ -2975,6 +2982,25 @@ private:
+             }
+         });
+ 
++        // X1 fallback (X1_DRAFT_FALLBACK=<share>, unset/0 = off): when more than <share> of a drafting slot's last 32 tokens
++        // are outside the X1 draft list (non-Latin text), its draft uses the full-vocab head; back to the list when the
++        // share drops. Changes only which tokens the draft can propose; verify decides every output token.
++        if (!drafting.empty()) {
++            static const float x1_fb = [] { const char * e = getenv("X1_DRAFT_FALLBACK"); return e ? (float) atof(e) : 0.0f; }();
++            if (x1_fb > 0.0f && llama_x1_draft_list_ready()) {
++                int full = 0;
++                for (const server_slot * s : drafting) {
++                    const auto & t = s->spec_prompt;
++                    int n = 1, oov = llama_x1_draft_list_has(s->sampled) ? 0 : 1;
++                    for (size_t i = t.size(); i > 0 && n < 32; --i, ++n) {
++                        oov += llama_x1_draft_list_has(t[i - 1]) ? 0 : 1;
++                    }
++                    full |= (float) oov > x1_fb * (float) n;
++                }
++                llama_x1_draft_set_full(full);
++            }
++        }
++
+         // generate the actual drafts (if any)
+         if (!drafting.empty()) {
+             queue_tasks.yield_to_queue([&]() {

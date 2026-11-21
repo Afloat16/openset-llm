@@ -1,0 +1,457 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index b213e5ed9..2166fe922 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3134,6 +3134,8 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++int ggml_k6_node(const struct ggml_cgraph * cgraph, int node_n, const struct ggml_compute_params * params);   // K6 (ops.cpp)
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3176,10 +3178,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
++        // K6: -1 = not handled; 0 = folded into a later op (nothing to compute, nothing to sync); r > 0 = computed r nodes
++        const int k6r = ggml_k6_node(cgraph, node_n, &params);
++        if (k6r == 0) {
++            continue;
++        }
++        const int n_fused = k6r > 0 ? k6r - 1 : ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+         if (n_fused > 0) {
+             node_n += n_fused;
+-        } else {
++        } else if (k6r < 0) {
+             ggml_compute_forward(&params, node);
+         }
+ 
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index c1e415f61..115f8655e 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9797,6 +9797,400 @@ void ggml_compute_forward_flash_attn_back(
+ 
+ // ggml_compute_forward_ssm_conv
+ 
++// ---- K6: plain-decode recurrent-state fusions, GGML_K6 bitmask, release default 123 (0 = off) ----
++#include <cstdlib>
++#include <cstdio>
++static int k6_mode_v = -1;
++static inline int k6_mode(void) {
++    if (k6_mode_v < 0) { const char * e = getenv("GGML_K6"); const int v = e ? atoi(e) : 123 /* default: bits 1,2,8,16,32,64; 0 = off */; k6_mode_v = v; }
++    return k6_mode_v;
++}
++static long k6_dbg_n[7];   // thread 0: GDN in-place matches, conv matches, conv+silu matches, GDN row-fused, norm chains, GLU chains, sign chains
++static void k6_dbg_dump(void) { fprintf(stderr, "K6: gdn_inplace %ld, conv_fused %ld (with silu %ld), gdn_rowfused %ld, norm_chain %ld, glu_chain %ld, sign_chain %ld\n", k6_dbg_n[0], k6_dbg_n[1], k6_dbg_n[2], k6_dbg_n[3], k6_dbg_n[4], k6_dbg_n[5], k6_dbg_n[6]); }
++struct k6_tls_t {
++    const ggml_tensor * gdn; float * gdn_addr; bool gdn_rowfused;
++    const ggml_tensor * conv; ggml_tensor * conv_silu;
++};
++static thread_local k6_tls_t k6_tls;
++
++// the producing node behind reshapes/views
++static const ggml_tensor * k6_base(const ggml_tensor * t) {
++    while (t && t->view_src && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) t = t->view_src;
++    return t;
++}
++// a GET_ROWS that gathers exactly one f32 row of a 2D cache: the address of that row (row index read from the graph's
++// input data, so only valid during compute), else NULL
++static float * k6_row_addr(const ggml_tensor * g) {
++    if (!g || g->op != GGML_OP_GET_ROWS || g->type != GGML_TYPE_F32 || g->ne[1] != 1 || g->ne[2] != 1 || g->ne[3] != 1) return NULL;
++    const ggml_tensor * cache = g->src[0], * idx = g->src[1];
++    if (cache->type != GGML_TYPE_F32 || cache->nb[0] != sizeof(float) || cache->ne[0] != g->ne[0] || cache->ne[2] != 1 || cache->ne[3] != 1 ||
++        idx->type != GGML_TYPE_I32 || ggml_nelements(idx) != 1 || !cache->data || !idx->data) return NULL;
++    const int32_t r = *(const int32_t *) idx->data;
++    if (r < 0 || r >= cache->ne[1]) return NULL;
++    return (float *) ((char *) cache->data + (size_t) r * cache->nb[1]);
++}
++// a CPY whose destination is exactly `bytes` contiguous f32 at addr
++static bool k6_cpy_to_row(const ggml_tensor * cp, const float * addr, size_t bytes) {
++    return cp->op == GGML_OP_CPY && cp->type == GGML_TYPE_F32 && cp->data == (const void *) addr && ggml_is_contiguous(cp) &&
++           ggml_nbytes(cp) == bytes && cp->src[0]->type == GGML_TYPE_F32;
++}
++static int k6_index_of(const ggml_cgraph * cg, const ggml_tensor * t, int from, int to) {
++    for (int j = from < 0 ? 0 : from; j <= to && j < cg->n_nodes; ++j) if (cg->nodes[j] == t) return j;
++    return -1;
++}
++
++// K7 fix: a fused op writes its outputs while other threads still read its inputs, but ggml-alloc gave the outputs
++// memory by lifetime in the STOCK node order, so an output may sit on a freed input (e.g. the output norm's input, a
++// single-use GET_ROWS, under the norm chain's outputs: every thread reads all of it for the sum of squares while
++// another already writes its block -> rare run-to-run differences). Fuse only when every output is disjoint from every
++// input and from the other outputs; an exact in-place alias is allowed where the op is elementwise per block (same_ok).
++static bool k6_ovl(const ggml_tensor * a, const ggml_tensor * b, bool same_ok) {
++    if (!a || !b || !a->data || !b->data) return false;
++    const char * pa = (const char *) a->data, * pb = (const char *) b->data;
++    const size_t na = ggml_nbytes(a), nb = ggml_nbytes(b);
++    if (!(pa < pb + nb && pb < pa + na)) return false;
++    return !(same_ok && pa == pb && na == nb);
++}
++static bool k6_disjoint(const ggml_tensor * const * outs, int no, const ggml_tensor * const * ins, const bool * same_ok, int ni) {
++    for (int a = 0; a < no; ++a) {
++        for (int b = 0; b < ni; ++b) if (k6_ovl(outs[a], ins[b], same_ok[b])) return false;
++        for (int b = a + 1; b < no; ++b) if (k6_ovl(outs[a], outs[b], true)) return false;
++    }
++    return true;
++}
++
++// bit 1: GDN node i_gdn (plain mode, K = 1, one token, one sequence) whose input state is one gathered cache row and
++// whose new state is copied back to that same row -> the row address (and the CPY node), else NULL
++static float * k6_gdn_match(const ggml_cgraph * cg, int i_gdn, const ggml_tensor ** cpy_out) {
++    const ggml_tensor * d = cg->nodes[i_gdn];
++    if (d->op != GGML_OP_GATED_DELTA_NET || d->src[6] || ggml_get_op_params_i32(d, 0) != 1) return NULL;
++    const ggml_tensor * v = d->src[2];
++    if (v->ne[2] != 1 || v->ne[3] != 1) return NULL;
++    const ggml_tensor * g = k6_base(d->src[5]);
++    float * addr = k6_row_addr(g);
++    if (!addr) return NULL;
++    const int64_t S_v = v->ne[0], H = v->ne[1];
++    const size_t state_bytes = (size_t) S_v * S_v * H * sizeof(float);
++    if ((size_t) g->ne[0] * sizeof(float) != state_bytes || !ggml_is_contiguous(d->src[5])) return NULL;
++    // the gathered row feeds nothing but this op (through at most one reshape)
++    const int ig = k6_index_of(cg, g, i_gdn - 32, i_gdn);
++    if (ig < 0 || ggml_node_get_use_count(cg, ig) != 1) return NULL;
++    if (d->src[5] != g) {
++        const int ir = k6_index_of(cg, d->src[5], ig, i_gdn);
++        if (ir < 0 || ggml_node_get_use_count(cg, ir) != 1) return NULL;
++    }
++    for (int j = i_gdn + 1; j < cg->n_nodes && j <= i_gdn + 16; ++j) {
++        const ggml_tensor * cp = cg->nodes[j];
++        if (cp->op == GGML_OP_CPY && k6_base(cp->src[0]) == d) {
++            if (!k6_cpy_to_row(cp, addr, state_bytes) || cp->src[0]->view_offs != (size_t) S_v * H * sizeof(float) || !ggml_is_contiguous(cp->src[0])) return NULL;
++            if (cpy_out) *cpy_out = cp;
++            return addr;
++        }
++    }
++    return NULL;
++}
++
++// bit 2: SSM_CONV node i_s over CONCAT(reshaped gathered 3-column cache row, new column) with the CPY of the last three
++// columns back to that row, optionally followed (next node) by the silu of the conv output; nth: the compute threads
++struct k6_conv_m { float * addr; const float * x; const ggml_tensor * g, * cat, * cpy; ggml_tensor * silu; };
++static bool k6_conv_match(const ggml_cgraph * cg, int i_s, int nth, k6_conv_m * m) {
++    const ggml_tensor * s = cg->nodes[i_s];
++    if (s->op != GGML_OP_SSM_CONV || s->type != GGML_TYPE_F32 || s->ne[1] != 1 || s->ne[2] != 1) return false;
++    const ggml_tensor * cat = s->src[0], * w = s->src[1];
++    const int64_t nr = s->ne[0];
++    if (cat->op != GGML_OP_CONCAT || cat->type != GGML_TYPE_F32 || ggml_get_op_params_i32(cat, 0) != 0 || cat->ne[0] != 4 || cat->ne[1] != nr ||
++        cat->ne[2] != 1 || cat->ne[3] != 1 || !ggml_is_contiguous(cat) || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != nr || !ggml_is_contiguous(w)) return false;
++    const ggml_tensor * st = cat->src[0], * xs = cat->src[1];
++    if (st->type != GGML_TYPE_F32 || st->ne[0] != 3 || st->ne[1] != nr || !ggml_is_contiguous(st) ||
++        xs->type != GGML_TYPE_F32 || xs->ne[0] != 1 || xs->ne[1] != nr || xs->nb[1] != sizeof(float) || !xs->data) return false;
++    const ggml_tensor * g = k6_base(st);
++    float * addr = k6_row_addr(g);
++    if (!addr || g->ne[0] != 3 * nr) return false;
++    const int ig = k6_index_of(cg, g, i_s - 32, i_s);
++    const int ic = k6_index_of(cg, cat, ig < 0 ? 0 : ig, i_s);
++    if (ig < 0 || ic < 0 || ggml_node_get_use_count(cg, ig) != 1 || ggml_node_get_use_count(cg, ic) != 2) return false;   // cat: the CPY's view + this op
++    if (st != g) { const int ir = k6_index_of(cg, st, ig, ic); if (ir < 0 || ggml_node_get_use_count(cg, ir) != 1) return false; }
++    const ggml_tensor * cpy = NULL; ggml_tensor * silu = NULL;
++    const int64_t dr = (nr + nth - 1) / nth;   // the stock SSM_CONV's rows per thread: silu folds in when 16-aligned
++    for (int j = ic + 1; j < cg->n_nodes && j <= i_s + 1; ++j) {
++        ggml_tensor * n = cg->nodes[j];
++        if (n->op == GGML_OP_CPY && k6_base(n->src[0]) == cat) {
++            const ggml_tensor * vw = n->src[0];
++            if (vw->view_offs != sizeof(float) || vw->ne[0] != 3 || vw->ne[1] != nr || vw->nb[0] != sizeof(float) || vw->nb[1] != 4 * sizeof(float) ||
++                !k6_cpy_to_row(n, addr, 3 * nr * sizeof(float))) return false;
++            cpy = n;
++        }
++        if (j == i_s + 1 && n->op == GGML_OP_UNARY && ggml_get_unary_op(n) == GGML_UNARY_OP_SILU && n->src[0] == s && n->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(n) && ggml_nelements(n) == nr && ggml_is_contiguous(s) && (nth == 1 || dr % 16 == 0)) silu = n;
++    }
++    if (!cpy || cat->nb[1] != 4 * sizeof(float)) return false;
++    {   // K7: the conv input written at the CONCAT may not overlap the new column other threads still read
++        const ggml_tensor * outs[1] = { cat }; const ggml_tensor * ins[1] = { xs }; const bool ok[1] = { false };
++        if (!k6_disjoint(outs, 1, ins, ok, 1)) return false;
++    }
++    if (silu) {   // the silu is written inside SSM_CONV: not over its input (read by every thread) or the weights; in place on s is fine
++        const ggml_tensor * outs[1] = { silu }; const ggml_tensor * ins[3] = { cat, w, s }; const bool ok[3] = { false, false, true };
++        if (!k6_disjoint(outs, 1, ins, ok, 3)) silu = NULL;
++    }
++    m->addr = addr; m->x = (const float *) xs->data; m->g = g; m->cat = cat; m->cpy = cpy; m->silu = silu;
++    return true;
++}
++
++// bits 16/32: one-row chains ending in the Hadamard rotation that feeds a ternary matmul
++struct k6_chain { int n; const ggml_tensor * norm, * glu, * mulw, * muls, * fwht; int64_t D, hn; };   // n: nodes consumed at the head
++#if defined(GGML_F32_STEP)
++static bool k6_step_ok(int64_t hn) { return hn % GGML_F32_STEP == 0; }
++#else
++static bool k6_step_ok(int64_t hn) { (void) hn; return false; }   // no-SIMD build (portable x64 variant): leave these chains unfused
++#endif
++static bool k6_row1(const ggml_tensor * t, int64_t D) { return t->type == GGML_TYPE_F32 && t->ne[0] == D && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t); }
++static bool k6_chain_match(const ggml_cgraph * cg, int i, int mode, k6_chain * ch) {
++    const ggml_tensor * n0 = cg->nodes[i];
++    int j = i;
++    ch->norm = ch->glu = NULL;
++    ch->mulw = NULL;
++    if (n0->op == GGML_OP_RMS_NORM && (mode & 16)) {
++        if (!k6_row1(n0, n0->ne[0]) || !k6_row1(n0->src[0], n0->ne[0]) || ggml_node_get_use_count(cg, i) != 1) return false;   // the raw norm is not written
++        ch->D = n0->ne[0]; ch->norm = n0;
++        if (j + 1 >= cg->n_nodes) return false;
++        const ggml_tensor * m = cg->nodes[++j];   // the norm weight
++        if (m->op != GGML_OP_MUL || m->src[0] != n0 || !k6_row1(m, ch->D) || !k6_row1(m->src[1], ch->D)) return false;
++        ch->mulw = m;
++    } else if (n0->op == GGML_OP_GLU && (mode & 32)) {
++        if (ggml_get_glu_op(n0) != GGML_GLU_OP_SWIGLU || !n0->src[1] || !k6_row1(n0, n0->ne[0]) || !k6_row1(n0->src[0], n0->ne[0]) || !k6_row1(n0->src[1], n0->ne[0])) return false;
++        ch->D = n0->ne[0]; ch->glu = n0; ch->mulw = n0;
++    } else if (n0->op == GGML_OP_MUL && (mode & 64)) {   // a bare sign flip feeding the rotation (the GDN output and attention paths)
++        if (!k6_row1(n0, n0->ne[0]) || !k6_row1(n0->src[0], n0->ne[0])) return false;
++        ch->D = n0->ne[0]; ch->mulw = n0->src[0]; j = i - 1;
++    } else return false;
++    // the chain must be contiguous: its outputs are written at the head, and a node in between could share a buffer
++    // with them (ggml-alloc reuses memory by lifetime) -- the GDN layers' attn_norm is split by the conv-state nodes,
++    // so only its sign flip + rotation fuse there (bit 64)
++    if (j + 3 >= cg->n_nodes) return false;
++    const ggml_tensor * s = cg->nodes[++j];       // the sign flip
++    if (s->op != GGML_OP_MUL || s->src[0] != ch->mulw || !k6_row1(s, ch->D) || !k6_row1(s->src[1], ch->D)) return false;
++    const ggml_tensor * r = cg->nodes[++j];
++    if (r->op != GGML_OP_RESHAPE || r->view_src != s || r->ne[2] != 1 || r->ne[3] != 1) return false;
++    const ggml_tensor * h = cg->nodes[++j];
++    if (h->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(h, 1) != GGML_HINT_SRC0_IS_HADAMARD || h->src[1] != r || h->src[0]->type != GGML_TYPE_F32 ||
++        h->type != GGML_TYPE_F32 || !ggml_is_contiguous(h) || h->ne[2] != 1 || h->ne[3] != 1) return false;
++    const int64_t hn = h->src[0]->ne[0];
++    if (hn < 16 || (hn & (hn - 1)) || r->ne[0] != hn || ch->D % hn != 0 || h->ne[0] != hn || h->ne[1] != ch->D / hn || !k6_step_ok(hn)) return false;
++    ch->muls = s; ch->fwht = h; ch->hn = hn; ch->n = j - i + 1;
++    {   // K7: the norm's input is read whole by every thread (sum of squares), so it may not overlap any output at all;
++        // the GLU / sign inputs are read per block by the thread that writes that block, so an exact in-place alias is fine
++        const ggml_tensor * outs[3] = { ch->mulw, s, h };
++        if (ch->norm) { const ggml_tensor * ins[3] = { ch->norm->src[0], ch->mulw->src[1], s->src[1] }; const bool ok[3] = { false, false, false };
++                        if (!k6_disjoint(outs, 3, ins, ok, 3)) return false; }
++        else if (ch->glu) { const ggml_tensor * ins[3] = { ch->glu->src[0], ch->glu->src[1], s->src[1] }; const bool ok[3] = { true, true, false };
++                            if (!k6_disjoint(outs, 3, ins, ok, 3)) return false; }
++        else { const ggml_tensor * outs2[2] = { s, h }; const ggml_tensor * ins[2] = { ch->mulw, s->src[1] }; const bool ok[2] = { true, false };
++               if (!k6_disjoint(outs2, 2, ins, ok, 2)) return false; }
++    }
++    return true;
++}
++#if defined(GGML_SIMD)
++// one Walsh-Hadamard row, the same passes as ggml_compute_forward_fwht_impl<float>
++static void k6_fwht_row(const float * src, float * dst, int64_t n, float scale) {
++    for (int64_t j = 0; j < n; j++) dst[j] = src[j] * scale;
++    const int step = GGML_F32_EPR;
++    for (int64_t len = 1; len < step && len < n; len <<= 1)
++        for (int64_t i = 0; i < n; i += 2 * len)
++            for (int64_t j = 0; j < len; j++) { const float u = dst[i + j], v = dst[i + len + j]; dst[i + j] = u + v; dst[i + len + j] = u - v; }
++    const GGML_F32_VEC v_minus_one = GGML_F32_VEC_SET1(-1.0f);
++    for (int64_t len = step; len < n; len <<= 1)
++        for (int64_t i = 0; i < n; i += 2 * len)
++            for (int64_t j = 0; j < len; j += step) {
++                GGML_F32_VEC u = GGML_F32_VEC_LOAD(dst + i + j), v = GGML_F32_VEC_LOAD(dst + i + len + j);
++                GGML_F32_VEC_STORE(dst + i + j, GGML_F32_VEC_ADD(u, v));
++                GGML_F32_VEC_STORE(dst + i + len + j, GGML_F32_VEC_FMA(u, v, v_minus_one));
++            }
++}
++static void k6_chain_compute(const k6_chain * ch, const ggml_compute_params * params) {
++    const int64_t D = ch->D, hn = ch->hn, nblk = D / hn;
++    float scale = 0.0f;
++    const float * x = NULL, * w = NULL;
++    float * y1 = (float *) ch->mulw->data;
++    if (ch->norm) {   // the stock sequential double sum, on every thread
++        x = (const float *) ch->norm->src[0]->data; w = (const float *) ch->mulw->src[1]->data;
++        float eps; memcpy(&eps, ch->norm->op_params, sizeof(float));
++        ggml_float sum = 0.0;
++        for (int64_t i = 0; i < D; i++) sum += (ggml_float)(x[i] * x[i]);
++        const float mean = sum / D;
++        scale = 1.0f / sqrtf(mean + eps);
++    }
++    const float * sg = (const float *) ch->muls->src[1]->data;
++    float * y2 = (float *) ch->muls->data, * out = (float *) ch->fwht->data;
++    const float fscale = 1.0f / sqrtf((float) hn);
++    for (int64_t b = params->ith; b < nblk; b += params->nth) {
++        const int64_t o = b * hn;
++        if (ch->norm) {
++            for (int64_t j = o; j < o + hn; j++) y1[j] = x[j] * scale * w[j];
++        } else if (ch->glu) {
++            ggml_vec_swiglu_f32((int) hn, y1 + o, (const float *) ch->glu->src[0]->data + o, (const float *) ch->glu->src[1]->data + o);
++        }
++        ggml_vec_mul_f32((int) hn, y2 + o, y1 + o, sg + o);
++        k6_fwht_row(y2 + o, out + o, hn, fscale);
++    }
++}
++#endif
++
++// the fused conv-state step (pure copies, so any row split gives the same bytes): conv input row r =
++// (state row r, x[r]), state row r <- (s1, s2, x[r]) in place on the cache row
++static void k6_conv_state_step(const k6_conv_m * m, const ggml_compute_params * params) {
++    const int64_t nr = m->cat->ne[1], dr = (nr + params->nth - 1) / params->nth;
++    const int64_t r0 = MIN(dr * params->ith, nr), r1 = MIN(r0 + dr, nr);
++    float * st = m->addr, * ci = (float *) m->cat->data;
++    const float * x = m->x;
++    for (int64_t r = r0; r < r1; ++r) {
++        const float a = st[3 * r], b = st[3 * r + 1], c = st[3 * r + 2], xr = x[r];
++        ci[4 * r] = a; ci[4 * r + 1] = b; ci[4 * r + 2] = c; ci[4 * r + 3] = xr;
++        st[3 * r] = b; st[3 * r + 1] = c; st[3 * r + 2] = xr;
++    }
++}
++static bool k6_skip_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params, int mode, int dbg);
++extern "C" int ggml_k6_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params) {
++    const int mode = k6_mode();
++    if (!mode || params->use_ref) return -1;
++    static int dbg = -1;
++    if (dbg < 0 && params->ith == 0) { dbg = getenv("GGML_K6_DBG") ? 1 : 0; if (dbg) atexit(k6_dbg_dump); }
++    const ggml_tensor * n = cg->nodes[i];
++#if defined(GGML_SIMD)
++    if ((mode & 112) && (n->op == GGML_OP_RMS_NORM || n->op == GGML_OP_GLU || n->op == GGML_OP_MUL)) {
++        k6_chain ch;
++        if (k6_chain_match(cg, i, mode, &ch)) {
++            k6_chain_compute(&ch, params);
++            if (params->ith == 0 && dbg > 0) ++k6_dbg_n[ch.norm ? 4 : ch.glu ? 5 : 6];
++            return ch.n;
++        }
++        return -1;
++    }
++#endif
++    if ((mode & 2) && n->op == GGML_OP_CONCAT) {   // the fused conv-state step: computed here, the CPY after it is skipped
++        for (int j = i + 1; j < cg->n_nodes && j <= i + 16; ++j)
++            if (cg->nodes[j]->op == GGML_OP_SSM_CONV) {
++                k6_conv_m m;
++                if (k6_conv_match(cg, j, params->nth, &m) && m.cat == n) { k6_conv_state_step(&m, params); return 1; }
++            }
++        return -1;
++    }
++    return k6_skip_node(cg, i, params, mode, dbg) ? 0 : -1;
++}
++
++static bool k6_skip_node(const struct ggml_cgraph * cg, int i, const struct ggml_compute_params * params, int mode, int dbg) {
++    const ggml_tensor * n = cg->nodes[i];
++    if ((mode & 128) && ggml_nelements(n) == 0) return true;   // the zero-row state ops of a one-sequence graph: nothing to compute, no barrier
++    switch (n->op) {
++        case GGML_OP_GATED_DELTA_NET: {
++            k6_tls.gdn = NULL;
++            const ggml_tensor * v = n->src[2];
++            const bool simple = !n->src[6] && ggml_get_op_params_i32(n, 0) == 1 && v->ne[2] == 1 && v->ne[3] == 1;   // plain decode: K = 1, one token, one sequence
++            float * addr = (mode & 1) && simple ? k6_gdn_match(cg, i, NULL) : NULL;
++            if (addr || ((mode & 4) && simple)) { k6_tls.gdn = n; k6_tls.gdn_addr = addr; k6_tls.gdn_rowfused = (mode & 4) != 0; }
++            if (params->ith == 0 && dbg > 0) { k6_dbg_n[0] += addr != NULL; k6_dbg_n[3] += (mode & 4) != 0; }
++            return false;
++        }
++        case GGML_OP_SSM_CONV: {
++            k6_conv_m m;
++            k6_tls.conv = NULL;
++            if ((mode & 2) && k6_conv_match(cg, i, params->nth, &m)) { k6_tls.conv = n; k6_tls.conv_silu = m.silu;
++                if (params->ith == 0 && dbg > 0) { ++k6_dbg_n[1]; k6_dbg_n[2] += m.silu != NULL; } }
++            return false;
++        }
++        case GGML_OP_GET_ROWS: {
++            if (n->type != GGML_TYPE_F32 || n->ne[1] != 1 || !k6_row_addr(n)) return false;
++            for (int j = i + 1; j < cg->n_nodes && j <= i + 32; ++j) {
++                const ggml_tensor * d = cg->nodes[j];
++                if ((mode & 1) && d->op == GGML_OP_GATED_DELTA_NET && k6_base(d->src[5]) == n) return k6_gdn_match(cg, j, NULL) != NULL;
++                if ((mode & 2) && d->op == GGML_OP_SSM_CONV) { k6_conv_m m; if (k6_conv_match(cg, j, params->nth, &m) && m.g == n) return true; }
++            }
++            return false;
++        }
++        case GGML_OP_CPY: {
++            const ggml_tensor * b = k6_base(n->src[0]);
++            if ((mode & 1) && b->op == GGML_OP_GATED_DELTA_NET) {
++                const int jd = k6_index_of(cg, b, i - 16, i);
++                const ggml_tensor * cp = NULL;
++                return jd >= 0 && k6_gdn_match(cg, jd, &cp) && cp == n;
++            }
++            if ((mode & 2) && b->op == GGML_OP_CONCAT) {
++                for (int j = i + 1; j < cg->n_nodes && j <= i + 16; ++j)
++                    if (cg->nodes[j]->op == GGML_OP_SSM_CONV) { k6_conv_m m; if (k6_conv_match(cg, j, params->nth, &m) && m.cpy == n) return true; }
++            }
++            return false;
++        }
++        case GGML_OP_UNARY: {
++            if (!(mode & 2) || n->src[0]->op != GGML_OP_SSM_CONV) return false;
++            const int js = k6_index_of(cg, n->src[0], i - 1, i);
++            k6_conv_m m;
++            return js >= 0 && k6_conv_match(cg, js, params->nth, &m) && m.silu == n;
++        }
++        default: return false;
++    }
++}
++
++// the GDN decode step for heads [ir0, ir1): in place on the cache row (bit 1) and/or row-fused (bit 4); the same ggml
++// vec calls on the same rows as ggml_compute_forward_gated_delta_net_one_chunk, so the values are identical
++static void k6_gdn_chunk(ggml_tensor * dst, float * delta, int64_t ir0, int64_t ir1) {
++    const ggml_tensor * src_q = dst->src[0], * src_k = dst->src[1], * src_v = dst->src[2], * src_g = dst->src[3], * src_beta = dst->src[4], * src_state = dst->src[5];
++    const bool raw_gates = ggml_get_op_params_i32(dst, 1) != 0;
++    const float * raw_dt_bias = raw_gates ? (const float *) dst->src[7]->data : nullptr;
++    const float * raw_a = raw_gates ? (const float *) dst->src[8]->data : nullptr;
++    const int64_t S_v = src_v->ne[0], H = src_v->ne[1];
++    const bool kda = src_g->ne[0] == S_v;
++    float * attn_out_base = (float *) dst->data;
++    float * state_out_base = attn_out_base + S_v * H;
++    const float * state_in_base = (const float *) src_state->data;
++    const float scale = 1.0f / sqrtf((float) S_v);
++    for (int64_t ir = ir0; ir < ir1; ++ir) {
++        const int64_t iv1 = ir % H;
++        const int64_t iq1 = iv1 % src_q->ne[1], ik1 = iv1 % src_k->ne[1];
++        float * s_out;
++        if (k6_tls.gdn_addr) {
++            s_out = k6_tls.gdn_addr + iv1 * S_v * S_v;                               // in place on the cache row
++        } else {
++            s_out = state_out_base + iv1 * S_v * S_v;
++            memcpy(s_out, state_in_base + iv1 * S_v * S_v, S_v * S_v * sizeof(float));
++        }
++        float * attn_data = attn_out_base + iv1 * S_v;
++        const float * q_d = (const float *) ((const char *) src_q->data + iq1 * src_q->nb[1]);
++        const float * k_d = (const float *) ((const char *) src_k->data + ik1 * src_k->nb[1]);
++        const float * v_d = (const float *) ((const char *) src_v->data + iv1 * src_v->nb[1]);
++        float beta_val = *(const float *) ((const char *) src_beta->data + iv1 * src_beta->nb[1]);
++        const float * g_d = (const float *) ((const char *) src_g->data + iv1 * src_g->nb[1]);
++        float g0 = g_d[0];
++        if (raw_gates) {
++            beta_val = 1.0f / (1.0f + expf(-beta_val));
++            const float x = g0 + raw_dt_bias[iv1];
++            g0 = raw_a[iv1] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
++        }
++        if (!k6_tls.gdn_rowfused) {   // the stock pass order, only the state location changed
++            if (kda) {
++                for (int64_t i = 0; i < S_v; ++i) delta[i] = expf(g_d[i]);
++                for (int64_t j = 0; j < S_v; ++j) ggml_vec_mul_f32(S_v, &s_out[j * S_v], &s_out[j * S_v], delta);
++            } else {
++                ggml_vec_scale_f32(S_v * S_v, s_out, expf(g0));
++            }
++            for (int64_t j = 0; j < S_v; ++j) { float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1); delta[j] = (v_d[j] - sum) * beta_val; }
++            for (int64_t j = 0; j < S_v; ++j) ggml_vec_mad_f32(S_v, &s_out[j * S_v], k_d, delta[j]);
++            for (int64_t j = 0; j < S_v; ++j) { float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, q_d, 0, 1); attn_data[j] = sum * scale; }
++        } else {                      // row by row: every op is elementwise or row-local, so the row's values are the same
++            const float eg = kda ? 0.0f : expf(g0);
++            if (kda) for (int64_t i = 0; i < S_v; ++i) delta[i] = expf(g_d[i]);
++            for (int64_t j = 0; j < S_v; ++j) {
++                float * row = &s_out[j * S_v];
++                if (kda) ggml_vec_mul_f32(S_v, row, row, delta); else ggml_vec_scale_f32(S_v, row, eg);
++                float sum = 0.0f; ggml_vec_dot_f32(S_v, &sum, 0, row, 0, k_d, 0, 1);
++                const float dj = (v_d[j] - sum) * beta_val;
++                ggml_vec_mad_f32(S_v, row, k_d, dj);
++                float sq = 0.0f; ggml_vec_dot_f32(S_v, &sq, 0, row, 0, q_d, 0, 1);
++                attn_data[j] = sq * scale;
++            }
++        }
++    }
++}
++// ---- end K6 ----
++
+ static void ggml_compute_forward_ssm_conv_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -9848,6 +10242,11 @@ static void ggml_compute_forward_ssm_conv_f32(
+             }
+         }
+     }
++
++    // K6 bit 2: the silu UNARY after this node, on this thread's rows (dr is 16-aligned, checked by the matcher)
++    if (k6_tls.conv == dst && k6_tls.conv_silu && ir > 0) {
++        ggml_vec_silu_f32(ir, (float *) k6_tls.conv_silu->data + ir0, (const float *) dst->data + ir0);
++    }
+ }
+ 
+ void ggml_compute_forward_ssm_conv(
+@@ -11067,6 +11466,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+     const float scale = 1.0f / sqrtf((float) S_v);
+ 
++    if (k6_tls.gdn == dst) { k6_gdn_chunk(dst, delta, ir0, ir1); return; }   // K6
++
+     for (int64_t ir = ir0; ir < ir1; ++ir) {
+         const int64_t iv1 = ir % H; // head_index
+         const int64_t iv3 = ir / H; // sequence

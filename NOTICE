@@ -1,0 +1,51 @@
+openset-llm
+Copyright (c) 2026 Open Set Labs. Licensed under the MIT License (see LICENSE).
+
+This project builds on, and is a patch set for, the following work.
+
+ggml / llama.cpp
+  https://github.com/ggml-org/llama.cpp
+  Copyright (c) 2023-2026 The ggml authors. MIT License.
+  The engine, server, GGUF format and gguf-py are theirs; this repository only adds kernels and a patch set (patches/).
+
+PrismML llama.cpp fork (pinned at commit e3de715222b2667c54a267441159a5729f11155e)
+  https://github.com/PrismML-Eng/llama.cpp
+  MIT License (inherits llama.cpp's LICENSE, "The ggml authors").
+  The PTQ1_0 ternary type, its reference kernels and the Bonsai-2 runtime support come from this fork.
+
+Ternary-Bonsai-2-27B (PrismML), GGUF weights
+  https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf
+  Apache License 2.0. Downloaded from Hugging Face by install.sh; not redistributed here.
+
+Qwen3.8-27B (Qwen team), the base model Bonsai-2-27B is derived from
+  https://huggingface.co/Qwen
+  Apache License 2.0.
+
+unsloth, Qwen3.8-27B GGUF MTP (multi-token prediction) sidecar
+  https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
+  Apache License 2.0 (inherits Qwen's licence). Downloaded from Hugging Face by install.sh; its MTP layer is grafted
+  onto the Bonsai model locally (scripts/graft_mtp.py) for speculative decoding. Not redistributed here.
+
+Model weights are subject to their own licences (Apache 2.0 for all of the above). If you redistribute weights, or a
+container or template image that contains them, include the Apache 2.0 licence text and these notices with them.
+
+Benchmark data in bench/ is third-party material under its own licences, not this repository's MIT licence:
+
+bench/ctx_prompts.json: passages from the WikiText-2 test set (Wikipedia text; Merity et al., 2016)
+  https://huggingface.co/datasets/Salesforce/wikitext
+  Creative Commons Attribution-ShareAlike 3.0.
+
+bench/gsm8k.jsonl: 40 problems from GSM8K (Cobbe et al., 2021)
+  https://github.com/openai/grade-school-math
+  MIT License.
+
+bench/problems_q160.jsonl: problems from HumanEval (Chen et al., 2021) and MBPP (Austin et al., 2021)
+  https://github.com/openai/human-eval          MIT License.
+  https://github.com/google-research/google-research/tree/master/mbpp          Creative Commons Attribution 4.0.
+
+bench/prompts24.jsonl, bench/prompts_diag.jsonl: a mix of
+  - prompts drawn from Spec-Bench (Xia et al., 2024), https://github.com/hemingkx/Spec-Bench
+    (see that repository and the datasets it collects for their terms);
+  - code-edit prompts that quote CPython 3.13 standard-library files (fnmatch.py, heapq.py),
+    https://github.com/python/cpython, Python Software Foundation License;
+  - synthetic JSON prompts written for this benchmark (MIT, as the rest of this repository).

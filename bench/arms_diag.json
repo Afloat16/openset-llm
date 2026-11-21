@@ -1,0 +1,28 @@
+{
+ "ours_ns_r2": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 8 --ctx 4096 --no-spec"
+ },
+ "ours_ns_r3": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 8 --ctx 4096 --no-spec"
+ },
+ "ours_r2": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 8 --ctx 4096"
+ },
+ "ours_ns_pf0": {
+  "env": {
+   "GGML_ATTN_PF": "0"
+  },
+  "cmd": "@H@/release/serve --threads 8 --ctx 4096 --no-spec"
+ },
+ "ours_nox1": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 8 --ctx 4096 --no-x1"
+ },
+ "ours_ns_t1": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 4 --ctx 4096 --no-spec"
+ }
+}

@@ -1,0 +1,40 @@
+{
+ "ours": {
+  "env": {},
+  "cmd": "rm -rf @H@/.openset-llm/state; exec @H@/release/serve --threads 8 --ctx @C@ --host 127.0.0.1 --port 8080",
+  "note": "release default (resume on); state dir on disk, cleared at start"
+ },
+ "ours_nr": {
+  "env": {},
+  "cmd": "rm -rf @H@/.openset-llm/state; exec @H@/release/serve --threads 8 --ctx @C@ --no-resume --host 127.0.0.1 --port 8080"
+ },
+ "ours_ns": {
+  "env": {},
+  "cmd": "rm -rf @H@/.openset-llm/state; exec @H@/release/serve --threads 8 --ctx @C@ --no-spec --host 127.0.0.1 --port 8080"
+ },
+ "ours_ns_nr": {
+  "env": {},
+  "cmd": "rm -rf @H@/.openset-llm/state; exec @H@/release/serve --threads 8 --ctx @C@ --no-spec --no-resume --host 127.0.0.1 --port 8080"
+ },
+ "ik": {
+  "env": {},
+  "cmd": "exec /opt/ik-bin/llama-server -m @H@/.openset-llm/models/model.gguf -t 8 -c @C@ -np 1 -rtr --cache-ram 0 --ctx-checkpoints 1 --jinja --host 127.0.0.1 --port 8080"
+ },
+ "prism": {
+  "env": {},
+  "cmd": "exec /opt/prism-bin/llama-server -m @H@/.openset-llm/models/model.gguf -t 8 -c @C@ -np 1 --cache-ram 0 --ctx-checkpoints 1 --no-webui --jinja --host 127.0.0.1 --port 8080"
+ },
+ "prev": {
+  "env": {
+   "OPENSET_LLM_HOME": "@H@/.prev"
+  },
+  "cmd": "exec @H@/release-prev/serve --threads 8 --ctx @C@ --host 127.0.0.1 --port 8080",
+  "note": "earlier build default"
+ },
+ "prev_ns": {
+  "env": {
+   "OPENSET_LLM_HOME": "@H@/.prev"
+  },
+  "cmd": "exec @H@/release-prev/serve --threads 8 --ctx @C@ --no-spec --host 127.0.0.1 --port 8080"
+ }
+}

@@ -1,0 +1,8 @@
+*.gguf
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+.DS_Store

@@ -1,0 +1,13 @@
+{
+ "new": {
+  "env": {},
+  "cmd": "@H@/release/serve --threads 8 --ctx 4096"
+ },
+ "prev": {
+  "env": {
+   "OPENSET_LLM_HOME": "@H@/.prev"
+  },
+  "cmd": "@H@/release-prev/serve --threads 8 --ctx 4096",
+  "note": "earlier build (0001-0005)"
+ }
+}
