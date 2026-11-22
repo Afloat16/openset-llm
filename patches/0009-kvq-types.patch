@@ -20,7 +20,7 @@ index c9339461c..61f879010 100644
          GGML_TYPE_Q2_0    = 42,
          // Prism-private Q2_0 at group size 128 (upstream Q2_0 is group 64). High id so it
          // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
-+        // cpu27b: low-bit KV cache rows (ggml-cpu/kvq.h; CPU attention kernel only)
++        // openset-llm: low-bit KV cache rows (ggml-cpu/kvq.h; CPU attention kernel only)
 +        GGML_TYPE_KV6   = 139,
 +        GGML_TYPE_KV5   = 140,
 +        GGML_TYPE_KV4   = 141,
