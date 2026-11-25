@@ -23,6 +23,12 @@
   <img src="docs/race.gif" width="820" alt="Three engines answering the same prompt side by side on one 8 vCPU / 8 GB machine; this engine finishes first.">
 </p>
 
+```sh
+git clone https://github.com/opensetlabs/openset-llm && cd openset-llm && ./start
+```
+
+<p align="center"><sub>Linux (or WSL2), a CPU with AVX-512, 8 GB of RAM. The first run builds the engine and downloads the model (~7.3 GB), then opens a chat page. <a href="#quick-start">Details</a></sub></p>
+
 An LLM is not a sealed box. It is a stack of parts you can rewrite: matmul kernels, decoding, attention, caches. People
 already rewire single neurons to change what a model does; we rewired the machinery underneath to change where it runs.
 Do that, and a 27B model runs on the hardware the world already owns, ordinary CPUs, not just GPUs. Search,
