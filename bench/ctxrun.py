@@ -14,6 +14,7 @@ cgroup memory.current/peak/anon/file/shmem (in a container the 16 GB limit is th
 major faults of the server during the request, and whether the server survived (exit code / signal if not).
 """
 import argparse, hashlib, json, os, random, shlex, signal, socket, subprocess, sys, threading, time, urllib.request
+from result_rows import read_rows
 
 HOST = socket.gethostname()
 
@@ -125,17 +126,14 @@ def main():
     for d in ("logs", "outputs"):
         os.makedirs(os.path.join(outdir, d), exist_ok=True)
     done = set()
-    if os.path.exists(a.out):
-        for l in open(a.out):
-            r = json.loads(l)
-            done.add((r["round"], r["ctx"], r["arm"], r["mode"]))
+    previous = read_rows(a.out) if os.path.exists(a.out) else []
+    for r in previous:
+        done.add((r["round"], r["ctx"], r["arm"], r["mode"]))
     print(f"# {len(plan)} jobs, {len(done)} done", file=sys.stderr, flush=True)
     failed = {}   # jobs with "stop_on_fail": an arm that failed a fill at C skips later fills at >= C
-    if os.path.exists(a.out):
-        for l in open(a.out):
-            r = json.loads(l)
-            if r["mode"] == "fill" and r["status"] != "ok":
-                failed[r["arm"]] = min(failed.get(r["arm"], 1 << 30), r["ctx_n"])
+    for r in previous:
+        if r["mode"] == "fill" and r["status"] != "ok":
+            failed[r["arm"]] = min(failed.get(r["arm"], 1 << 30), r["ctx_n"])
     for j in plan:
         key = (j["round"], j["ctx"], j["arm"], j["mode"])
         if key in done:
