@@ -38,6 +38,9 @@ def main() -> None:
         if name in skip:
             continue
         vtype = f.types[0]
+        if name == "general.alignment":
+            w.add_custom_alignment(int(f.parts[-1][0]))
+            continue
         if name == f"{arch}.block_count":
             w.add_uint32(name, n_layer + 1)
             continue
