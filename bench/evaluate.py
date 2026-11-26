@@ -41,7 +41,9 @@ def sanitize(code: str) -> str:
     else:
         return ""
     keep = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign)
-    return "\n".join(ast.get_source_segment("\n".join(lines), n) for n in tree.body if isinstance(n, keep))
+    # Function/class source segments start at the definition, after any decorators.
+    # Unparse the complete node so sanitized grading keeps decorator semantics.
+    return "\n".join(ast.unparse(n) for n in tree.body if isinstance(n, keep))
 
 
 def program(p: dict, text: str, clean: bool) -> str:
