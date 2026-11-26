@@ -19,9 +19,17 @@ command -v python3 >/dev/null || { echo "python3 is needed" >&2; exit 1; }
 PREFIX=${OPENSET_LLM_HOME:-$HOME/.openset-llm}
 [ -x "$PREFIX/bin/llama-server" ] || { echo "not installed: run ./install.sh (or ./start) first" >&2; exit 1; }
 if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then echo "port $PORT is in use; pass --port" >&2; exit 1; fi
-LOG=$(mktemp); PID=
-stop() { [ -n "$PID" ] && kill "$PID" 2>/dev/null && wait "$PID" 2>/dev/null; PID=; return 0; }
-trap 'stop; rm -f "$LOG"' EXIT
+LOG=$(mktemp); ROWS=$(mktemp); PID=
+stop() {
+  if [ -n "$PID" ]; then
+    kill "$PID" 2>/dev/null || true
+    wait "$PID" 2>/dev/null || true
+  fi
+  PID=
+}
+trap 'stop; rm -f "$LOG" "$ROWS"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 arm() {   # arm <label> <serve args...>: one server, NP prompts, one result line on stdout
   local label=$1; shift
@@ -60,8 +68,13 @@ cores=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket/ {c=$2} /^Socket\(s\
 ram=$(awk '/^MemTotal:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)
 commit=$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo "no git checkout")
 echo "measuring: $NP prompts x $NTOK tokens per row (a few minutes)..." >&2
-rows=$(arm "./serve"); [ "$PLAIN" = 1 ] && rows="$rows
-$(arm "./serve --no-spec" --no-spec)"
+# Keep arms in this shell: command substitution disables errexit and hides PID
+# from the EXIT trap, so a failed request could otherwise print a success report.
+arm "./serve" > "$ROWS"
+if [ "$PLAIN" = 1 ]; then
+  arm "./serve --no-spec" --no-spec >> "$ROWS"
+fi
+rows=$(cat "$ROWS")
 cat <<OUT
 
 **openset-llm quick check** (\`bench/quick.sh\`, commit $commit, $(date -u +%Y-%m-%d))
