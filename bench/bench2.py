@@ -193,7 +193,9 @@ def main() -> None:
                             if proc.poll() is not None:
                                 port, proc, log = start(arm, arms[arm], logdir, f"r{a.rep}b{bi}x")
                             continue
-                        smp.halt = True
+                        finally:
+                            smp.halt = True
+                            smp.join()
                         msg = r["choices"][0]["message"]
                         reasoning = msg.get("reasoning_content") or ""
                         try:
