@@ -28,14 +28,18 @@ def req(port, p, out, i):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
-    ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--rounds", type=int, default=3, help="positive round count; prompts cycle after the first three rounds")
     a = ap.parse_args()
+    if a.rounds < 1:
+        ap.error("--rounds must be positive")
     os.makedirs(a.out, exist_ok=True)
     P = [json.loads(l) for l in open("prompts24.jsonl")]
     P = [p for p in P if not p["id"].startswith("code-")][:12]   # short prompts: the 2k-per-stream context fits
+    if len(P) < 4:
+        ap.error("need at least four non-code prompts for the four-stream comparison")
     f = open(os.path.join(a.out, "multi.jsonl"), "a")
     for rd in range(a.rounds):
-        ps = P[rd * 4:(rd + 1) * 4]
+        ps = [P[(rd * 4 + i) % len(P)] for i in range(4)]
         order = list(ARMS)
         random.Random(f"m{rd}").shuffle(order)
         for arm in order:
