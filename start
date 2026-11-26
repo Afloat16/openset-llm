@@ -7,14 +7,23 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PREFIX=${OPENSET_LLM_HOME:-$HOME/.openset-llm}
-PORT=8080; args=("$@")
-for ((i = 0; i < ${#args[@]}; i++)); do [ "${args[i]}" = --port ] && PORT=${args[i+1]:-8080}; done
+HOST=127.0.0.1; PORT=8080; WEBUI=1; args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case ${args[i]} in
+    --host) HOST=${args[i+1]:-127.0.0.1} ;;
+    --port) PORT=${args[i+1]:-8080} ;;
+    --no-webui) WEBUI=0 ;;
+  esac
+done
 case "${1:-}" in -h|--help) sed -n '2,6p' "$0"; exit 0 ;; esac
 if ! { [ -x "$PREFIX/bin/llama-server" ] && [ -f "$PREFIX/models/model.gguf" ]; }; then
   echo "First run: installing (this downloads the model and can take a while)..."
   bash "$HERE/install.sh"
 fi
-URL=http://127.0.0.1:$PORT
+SHOW=$HOST
+case $HOST in 0.0.0.0) SHOW=127.0.0.1 ;; ::) SHOW=::1 ;; esac
+case $SHOW in *:*) SHOW=[$SHOW] ;; esac
+URL=http://$SHOW:$PORT
 open_page() {   # Linux desktop, WSL, or just print the address
   if command -v xdg-open >/dev/null 2>&1 && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then xdg-open "$URL" >/dev/null 2>&1 && return
   elif command -v wslview >/dev/null 2>&1; then wslview "$URL" >/dev/null 2>&1 && return
@@ -22,6 +31,7 @@ open_page() {   # Linux desktop, WSL, or just print the address
   fi
   echo "Open $URL in your browser."
 }
+if [ "$WEBUI" = 1 ]; then
 ( ( sleep 1
   for _ in $(seq 1 600); do
     kill -0 $$ 2>/dev/null || exit 0   # the server (this very process after the exec below) has gone: say nothing
@@ -29,5 +39,6 @@ open_page() {   # Linux desktop, WSL, or just print the address
     sleep 1
   done
   echo "Still loading after 600 s. Open $URL once the server says it is listening." ) & )   # detached: no zombie under the server
+fi
 # exec: the server takes over this process, so Ctrl+C, kill and closing the terminal all reach it and none leaves it behind
 exec bash "$HERE/serve" "$@"
