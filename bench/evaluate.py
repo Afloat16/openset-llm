@@ -13,6 +13,7 @@ import json
 import os
 import re
 import resource
+import signal
 import subprocess
 import sys
 import tempfile
@@ -63,15 +64,29 @@ def run(src: str) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory() as d:
         f = os.path.join(d, "prog.py")
         open(f, "w").write(src)
-        try:
-            r = subprocess.run([sys.executable, "-I", f], cwd=d, capture_output=True, timeout=10, preexec_fn=limits,
-                               stdin=subprocess.DEVNULL, text=True)
-        except subprocess.TimeoutExpired:
-            return False, "timeout"
-        if r.returncode == 0:
-            return True, ""
-        err = (r.stderr.strip().splitlines() or ["rc %d" % r.returncode])[-1]
-        return False, err[:200]
+        with subprocess.Popen([sys.executable, "-I", f], cwd=d, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              preexec_fn=limits, stdin=subprocess.DEVNULL, text=True) as proc:
+            try:
+                try:
+                    _, stderr = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.communicate()
+                    return False, "timeout"
+                if proc.returncode == 0:
+                    return True, ""
+                err = (stderr.strip().splitlines() or ["rc %d" % proc.returncode])[-1]
+                return False, err[:200]
+            finally:
+                # limits() creates a session; children belong to this evaluation too.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
 
 
 def main():
