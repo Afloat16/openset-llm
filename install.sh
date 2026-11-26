@@ -211,7 +211,8 @@ if [ ! -f "$M/model.gguf" ]; then
     fi
     say "Attaching the multi-token-prediction (MTP) head to the model (for speculative decoding)"
     "$PY" -I "$HERE/scripts/graft_mtp.py" --gguf-py "$SRC/gguf-py" "$M/base.gguf" "$M/mtp-sidecar.gguf" "$M/model.gguf.part"
-    mv "$M/model.gguf.part" "$M/model.gguf" && rm -f "$M/base.gguf" "$M/mtp-sidecar.gguf"
+    mv "$M/model.gguf.part" "$M/model.gguf"
+    rm -f "$M/base.gguf" "$M/mtp-sidecar.gguf" "$M/no-mtp"
     rm -rf "$PREFIX/gguf-src"
   else
     mv "$M/base.gguf" "$M/model.gguf"
