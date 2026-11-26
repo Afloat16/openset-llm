@@ -137,7 +137,8 @@ def start_server(arm, a, out, tag):
 def server_pid(shell_pid):
     """The llama-server process under the shell / serve wrapper (exec'd, so usually the same pid)."""
     try:
-        out = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, text=True).stdout.split()
+        out = subprocess.run(["pgrep", "-g", str(shell_pid), "-x", "llama-server"],
+                             capture_output=True, text=True).stdout.split()
         return int(out[0]) if out else shell_pid
     except Exception:
         return shell_pid
@@ -146,13 +147,19 @@ def server_pid(shell_pid):
 def stop_server(srv):
     try:
         os.killpg(srv.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
         srv.wait(timeout=60)
-    except Exception:
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # Reap the leader and stop any remaining children of this run only.
         try:
             os.killpg(srv.pid, signal.SIGKILL)
-        except Exception:
+        except ProcessLookupError:
             pass
-    subprocess.run("pkill -9 -f llama-server", shell=True)
+        srv.wait()
     time.sleep(2)
 
 
@@ -210,8 +217,6 @@ def main():
     arm = json.load(open(a.arms))[a.arm]
     data = json.load(open(a.replay))
     name = a.arm + a.tag
-    subprocess.run("pkill -9 -f llama-server", shell=True)
-    time.sleep(1)
     srv, pid, cmd = start_server(arm, a, out, a.tag)
     meta = {"arm": a.arm, "tag": a.tag, "cmd": cmd, "env": arm.get("env", {}), "ctx": a.ctx, "gen": a.gen,
             "replay": a.replay, "t_start": time.strftime("%FT%TZ", time.gmtime()),
