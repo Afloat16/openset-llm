@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import urllib.request
+from result_rows import read_rows
 
 
 def free_port() -> int:
@@ -156,8 +157,7 @@ def main() -> None:
         os.makedirs(os.path.join(outdir, "outputs", arm), exist_ok=True)
     done = set()
     if os.path.exists(a.out):
-        for l in open(a.out):
-            r = json.loads(l)
+        for r in read_rows(a.out):
             if "error" not in r:
                 done.add((r["prompt_id"], r["arm"], r["rep"]))
     host = socket.gethostname()
