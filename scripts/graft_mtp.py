@@ -11,6 +11,8 @@ model's (see the README's Numbers).
     python -I graft_mtp.py --gguf-py <llama.cpp>/gguf-py base.gguf mtp-sidecar.gguf out.gguf
 """
 import argparse
+import os
+from pathlib import Path
 import sys
 
 
@@ -21,6 +23,10 @@ def main() -> None:
     p.add_argument("out")
     p.add_argument("--gguf-py", required=True, help="path to a gguf-py that knows the base's quant types")
     a = p.parse_args()
+    output = Path(a.out)
+    for source in (Path(a.base), Path(a.sidecar)):
+        if output.resolve() == source.resolve() or (output.exists() and os.path.samefile(output, source)):
+            p.error("output must be different from both input files")
     sys.path.insert(0, a.gguf_py)
     import gguf
     from gguf import GGUFReader, GGUFWriter, GGUFValueType
