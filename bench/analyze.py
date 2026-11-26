@@ -255,6 +255,17 @@ def ctx():
     if not R:
         return
     print("## 3. Long context: one WikiText haystack per depth (2026-11-09 harness), 128 greedy tokens, same text for every engine\n")
+    probes = [r for r in R if r.get("mode") == "load"]
+    if probes:
+        print("**Load-only fit probes** (no generation or throughput measurement):\n")
+        print("| box | round | depth | arm | status |")
+        print("|---|---|---|---|---|")
+        for r in probes:
+            print(f"| {r['_box']} | {r['round']} | {r['ctx_n'] // 1024}k | {r['arm']} | {r['status']} |")
+        print()
+    R = [r for r in R if r.get("mode", "fill") == "fill"]
+    if not R:
+        return
     print("Decode = reply tok/s after the prompt; prefill = prompt tok/s. Medians over rounds; ratios paired per (box, round).\n")
     print("| class | depth | arm | n | decode tok/s | prefill tok/s | acceptance | peak RssAnon MiB | min MemAvailable MiB | status | recall |")
     print("|---|---|---|---|---|---|---|---|---|---|---|")
