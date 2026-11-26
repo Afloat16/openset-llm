@@ -116,19 +116,33 @@ def start_server(arm, a, out, tag):
         if not subprocess.run(f"ss -tan | grep -q ':{PORT} '", shell=True).returncode == 0:
             break
         time.sleep(1)
+    else:
+        raise SystemExit(f"port {PORT} is still in use after 120 s; stop its owner or retry later")
     log = open(out / f"server_{a.arm}{tag}.log", "w")
     # nothing touches oom_score_adj (driver and server both at the default 0)
     srv = subprocess.Popen(cmd, shell=True, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
-    for _ in range(900):
+    try:
+        for _ in range(900):
+            if srv.poll() is not None:
+                raise SystemExit(f"server died at load, see {log.name}")
+            try:
+                with urllib.request.urlopen(URL + "/health", timeout=5) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            raise SystemExit(f"server not healthy after 900 s, see {log.name}")
+    except BaseException:
         try:
-            with urllib.request.urlopen(URL + "/health", timeout=5) as r:
-                if r.status == 200:
-                    break
-        except Exception:
+            os.killpg(srv.pid, signal.SIGKILL)
+        except ProcessLookupError:
             pass
-        if srv.poll() is not None:
-            raise SystemExit(f"server died at load, see {log.name}")
-        time.sleep(1)
+        srv.wait()
+        raise
+    finally:
+        log.close()
     time.sleep(1)
     pid = server_pid(srv.pid)
     return srv, pid, cmd
