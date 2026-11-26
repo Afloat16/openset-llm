@@ -7,7 +7,8 @@ alone on the same server (per-stream identity: a stream's reply must equal the s
 single-stream `--no-spec` servers given the first prompt alone (the per-stream baseline). Memory sampled per request.
     python3 multi.py --out ~/res/multi --rounds 3
 """
-import argparse, json, os, random, threading, time
+import argparse, json, os, random, time
+from concurrent.futures import ThreadPoolExecutor
 from bench2 import start, stop, post, Sampler
 
 ARMS = {
@@ -44,6 +45,7 @@ def main():
         random.Random(f"m{rd}").shuffle(order)
         for arm in order:
             port, proc, log = start(arm, ARMS[arm], a.out, f"r{rd}")
+            smp = None
             try:
                 post(port, {"messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 8, "temperature": 0,
                             "chat_template_kwargs": {"enable_thinking": False}})
@@ -51,8 +53,10 @@ def main():
                 if arm.endswith("_m4"):
                     res = [None] * 4
                     t0 = time.time()
-                    th = [threading.Thread(target=req, args=(port, p, res, i)) for i, p in enumerate(ps)]
-                    [t.start() for t in th]; [t.join() for t in th]
+                    with ThreadPoolExecutor(max_workers=4) as pool:
+                        requests = [pool.submit(req, port, p, res, i) for i, p in enumerate(ps)]
+                        for request in requests:
+                            request.result()  # propagate a failed stream before reading partial results
                     wall = max(x[2] for x in res) - t0
                     ntok = sum(x[0]["timings"]["predicted_n"] for x in res)
                     smp.halt = True
@@ -74,6 +78,9 @@ def main():
                 f.write(json.dumps(row) + "\n"); f.flush()
                 print(arm, rd, round(row["agg_tok_s"], 2), row.get("identical_to_alone"), flush=True)
             finally:
+                if smp is not None:
+                    smp.halt = True
+                    smp.join()
                 stop(proc)
     print("MULTI_DONE", flush=True)
 
