@@ -57,6 +57,13 @@ case $MULTI in ''|*[!0-9]*) echo "--multi takes a number of streams (2-8)" >&2; 
 for v in "$PORT" "$THREADS" ${CTX:+"$CTX"} ${DEPTH:+"$DEPTH"}; do
   case $v in ''|*[!0-9]*) echo "--port, --ctx, --threads and --spec-depth take a number (got: $v)" >&2; exit 2 ;; esac
 done
+# Bash arithmetic treats leading zeroes as octal; CLI numbers are decimal.
+for numeric_name in PORT THREADS CTX MULTI DEPTH; do
+  numeric_value=${!numeric_name}
+  [ -n "$numeric_value" ] || continue
+  numeric_value=${numeric_value#"${numeric_value%%[!0]*}"}
+  printf -v "$numeric_name" '%s' "${numeric_value:-0}"
+done
 CKPT=1; RESUME_MODE=full
 if [ "$MULTI" -ge 2 ]; then
   # X2: N streams share each pass over the weights. --ctx is per stream here. Speculation is off (X1/MTP + X2 is untested).
