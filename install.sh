@@ -122,10 +122,31 @@ if [ "$MODEL_ONLY" = 1 ]; then
   :
 elif [ -n "$BIN_URL" ]; then
   say "Fetching prebuilt binaries: $BIN_URL"
-  curl -fSL --retry 3 "$BIN_URL" | tar -xz -C "$PREFIX/bin" --strip-components=1 \
+  BIN_STAGE=$(mktemp -d "$PREFIX/.bin.XXXXXX")
+  BIN_PREVIOUS=$BIN_STAGE.previous
+  cleanup_bin_update() {
+    local update_status=$?
+    trap - EXIT
+    trap '' INT TERM
+    if [ -d "$BIN_PREVIOUS" ] && [ ! -e "$PREFIX/bin" ]; then
+      if ! mv "$BIN_PREVIOUS" "$PREFIX/bin"; then
+        echo "could not restore the previous engine; binaries remain in $BIN_PREVIOUS" >&2
+        [ "$update_status" != 0 ] || update_status=1
+      fi
+    fi
+    if ! rm -rf "$BIN_STAGE"; then
+      echo "could not remove the staging directory $BIN_STAGE" >&2
+      [ "$update_status" != 0 ] || update_status=1
+    fi
+    exit "$update_status"
+  }
+  trap cleanup_bin_update EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  curl -fSL --retry 3 "$BIN_URL" | tar -xz -C "$BIN_STAGE" --strip-components=1 \
     || die "could not download or unpack $BIN_URL"
   # a prebuilt engine only runs on the distribution it was built on or a newer one: find out now, before the download
-  engine_starts() { ver=$(LD_LIBRARY_PATH="$PREFIX/bin" "$PREFIX/bin/llama-server" --version 2>&1); }
+  engine_starts() { ver=$(LD_LIBRARY_PATH="$BIN_STAGE" "$BIN_STAGE/llama-server" --version 2>&1); }
   if ! engine_starts && case $ver in *libgomp.so.1*) true ;; *) false ;; esac; then
     say "Installing: libgomp1"; apt_install libgomp1 || true   # the one runtime library a bare system often lacks
   fi
@@ -135,6 +156,16 @@ elif [ -n "$BIN_URL" ]; then
        A missing library or a 'version ... not found' line means it was built on a newer distribution than this one.
        Run plain ./install.sh to build the engine here instead."
   fi
+  mv "$PREFIX/bin" "$BIN_PREVIOUS"
+  if mv "$BIN_STAGE" "$PREFIX/bin"; then
+    :
+  else
+    update_status=$?
+    echo "could not publish the prebuilt engine; restoring the previous binaries" >&2
+    exit "$update_status"
+  fi
+  rm -rf "$BIN_PREVIOUS"
+  trap - EXIT INT TERM
 else
   stamp="$FORK_SHA portable=$PORTABLE $(cat "$HERE"/patches/*.patch "$HERE"/kernels/* | cksum | cut -d' ' -f1)"
 fi
