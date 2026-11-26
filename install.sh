@@ -227,8 +227,18 @@ get() {   # repo file dest
   [ -f "$3" ] && return 0
   say "Downloading $1/$2"
   local auth=(); [ -n "${HF_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $HF_TOKEN")
-  curl -fL --retry 5 -C - "${auth[@]}" -o "$3.part" "$HF/$1/resolve/main/$2" \
-    || die "the download of $2 failed; run ./install.sh again to resume it"
+  if curl -fL --retry 5 -C - "${auth[@]}" -o "$3.part" "$HF/$1/resolve/main/$2"; then
+    :
+  else
+    download_status=$?
+    if [ "$download_status" = 33 ]; then
+      say "The server does not support resuming $2; restarting the download"
+      curl -fL --retry 5 "${auth[@]}" -o "$3.part" "$HF/$1/resolve/main/$2" \
+        || die "the download of $2 failed; run ./install.sh again to resume it"
+    else
+      die "the download of $2 failed; run ./install.sh again to resume it"
+    fi
+  fi
   mv "$3.part" "$3"
 }
 if [ ! -f "$M/model.gguf" ]; then
