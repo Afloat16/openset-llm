@@ -90,8 +90,10 @@ need_tools=()
 command -v curl >/dev/null || need_tools+=(curl)
 command -v python3 >/dev/null || need_tools+=(python3)
 BUILD=1; { [ -n "$BIN_URL" ] || [ "$MODEL_ONLY" = 1 ]; } && BUILD=0
+NEED_GIT=$BUILD
+if [ "$MTP" = 1 ] && [ ! -f "$PREFIX/models/model.gguf" ] && [ ! -d "$PREFIX/llama.cpp/gguf-py" ]; then NEED_GIT=1; fi
+if [ "$NEED_GIT" = 1 ]; then command -v git >/dev/null || need_tools+=(git); fi
 if [ "$BUILD" = 1 ]; then
-  command -v git >/dev/null || need_tools+=(git)
   command -v cmake >/dev/null || need_tools+=(cmake)
   command -v c++ >/dev/null || need_tools+=(build-essential)
   command -v ninja >/dev/null || need_tools+=(ninja-build)
@@ -114,7 +116,8 @@ if [ "$BUILD" = 1 ] && ! command -v cmake >/dev/null; then   # no apt/sudo: cmak
   "$PREFIX/venv/bin/pip" install -q cmake ninja && export PATH="$PREFIX/venv/bin:$PATH"
 fi
 for t in curl python3; do command -v $t >/dev/null || die "missing $t"; done
-if [ "$BUILD" = 1 ]; then for t in git cmake c++; do command -v $t >/dev/null || die "missing $t. On Ubuntu or Debian: sudo apt install -y build-essential cmake git (or use --bin-url)"; done; fi
+if [ "$NEED_GIT" = 1 ]; then command -v git >/dev/null || die "missing git; install git to build the engine or fetch the MTP reader"; fi
+if [ "$BUILD" = 1 ]; then for t in cmake c++; do command -v $t >/dev/null || die "missing $t. On Ubuntu or Debian: sudo apt install -y build-essential cmake git (or use --bin-url)"; done; fi
 
 # ---------------------------------------------------------------- engine
 SRC=$PREFIX/llama.cpp
