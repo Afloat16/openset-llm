@@ -25,5 +25,6 @@ cp "$here"/../kernels/ptq1-common.h "$here"/../kernels/ptq1-drop.h "$here"/../ke
 git -C "$src" checkout -q -- ggml/src/ggml-cpu/ggml-cpu.c ggml/src/ggml-cpu/ops.cpp src/models/qwen35.cpp \
    src/llama-context.cpp tools/server/server-context.cpp common/chat.h common/common.h common/arg.cpp ggml/include/ggml.h ggml/src/ggml.c
 for p in "$here"/0*.patch; do
-  git -C "$src" apply "$p" && echo "applied: $(basename "$p")"
+  git -C "$src" apply "$p"
+  echo "applied: $(basename "$p")"
 done
