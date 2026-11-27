@@ -128,10 +128,7 @@ if [ "$BUILD" = 1 ]; then for t in cmake c++; do command -v $t >/dev/null || die
 
 # ---------------------------------------------------------------- engine
 SRC=$PREFIX/llama.cpp
-if [ "$MODEL_ONLY" = 1 ]; then
-  :
-elif [ -n "$BIN_URL" ]; then
-  say "Fetching prebuilt binaries: $BIN_URL"
+begin_bin_update() {
   BIN_STAGE=$(mktemp -d "$PREFIX/.bin.XXXXXX")
   BIN_PREVIOUS=$BIN_STAGE.previous
   cleanup_bin_update() {
@@ -153,6 +150,26 @@ elif [ -n "$BIN_URL" ]; then
   trap cleanup_bin_update EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+}
+
+publish_bin_update() {
+  mv "$PREFIX/bin" "$BIN_PREVIOUS"
+  if mv "$BIN_STAGE" "$PREFIX/bin"; then
+    :
+  else
+    update_status=$?
+    echo "could not publish the engine; restoring the previous binaries" >&2
+    exit "$update_status"
+  fi
+  rm -rf "$BIN_PREVIOUS"
+  trap - EXIT INT TERM
+}
+
+if [ "$MODEL_ONLY" = 1 ]; then
+  :
+elif [ -n "$BIN_URL" ]; then
+  say "Fetching prebuilt binaries: $BIN_URL"
+  begin_bin_update
   curl -fSL --retry 3 "$BIN_URL" | tar -xz -C "$BIN_STAGE" --strip-components=1 \
     || die "could not download or unpack $BIN_URL"
   # a prebuilt engine only runs on the distribution it was built on or a newer one: find out now, before the download
@@ -166,16 +183,7 @@ elif [ -n "$BIN_URL" ]; then
        A missing library or a 'version ... not found' line means it was built on a newer distribution than this one.
        Run plain ./install.sh to build the engine here instead."
   fi
-  mv "$PREFIX/bin" "$BIN_PREVIOUS"
-  if mv "$BIN_STAGE" "$PREFIX/bin"; then
-    :
-  else
-    update_status=$?
-    echo "could not publish the prebuilt engine; restoring the previous binaries" >&2
-    exit "$update_status"
-  fi
-  rm -rf "$BIN_PREVIOUS"
-  trap - EXIT INT TERM
+  publish_bin_update
 else
   stamp="$FORK_SHA portable=$PORTABLE $(cat "$HERE"/patches/*.patch "$HERE"/kernels/* | cksum | cut -d' ' -f1)"
 fi
@@ -221,10 +229,17 @@ elif [ "$BUILD" = 1 ]; then
   [ "$jobs" -lt 1 ] && jobs=1
   cmake --build "$SRC/build" -j "$jobs" >>"$PREFIX/build.log" 2>&1 \
     || { tail -30 "$PREFIX/build.log"; die "build failed (log: $PREFIX/build.log)"; }
-  rm -f "$PREFIX"/bin/*
-  cp -a "$SRC"/build/bin/llama-server "$SRC"/build/bin/llama-bench "$SRC"/build/bin/llama-cli "$PREFIX/bin/" 2>/dev/null || true
-  cp -a "$SRC"/build/bin/*.so* "$PREFIX/bin/" 2>/dev/null || true
-  echo "$stamp" > "$PREFIX/bin/.stamp"
+  begin_bin_update
+  cp -a "$SRC/build/bin/llama-server" "$BIN_STAGE/"
+  for artifact in "$SRC/build/bin/llama-bench" "$SRC/build/bin/llama-cli" "$SRC"/build/bin/*.so*; do
+    [ -e "$artifact" ] || continue
+    cp -a "$artifact" "$BIN_STAGE/"
+  done
+  echo "$stamp" > "$BIN_STAGE/.stamp"
+  if ! LD_LIBRARY_PATH="$BIN_STAGE" "$BIN_STAGE/llama-server" --version >>"$PREFIX/build.log" 2>&1; then
+    die "the built engine cannot start (log: $PREFIX/build.log); keeping the previous engine"
+  fi
+  publish_bin_update
 fi
 [ -x "$PREFIX/bin/llama-server" ] || die "no llama-server in $PREFIX/bin"
 
