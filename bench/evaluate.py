@@ -9,6 +9,7 @@ asserts/prints do not count); `pass_raw` = the code exactly as written (its own 
     python3 evaluate.py problems.jsonl <results dir> > <results dir>/graded.jsonl
 """
 import ast
+import io
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import tokenize
 
 FENCE = re.compile(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\n(.*?)(?:```|\Z)", re.S)
 
@@ -47,9 +49,23 @@ def sanitize(code: str) -> str:
     return "\n".join(ast.unparse(n) for n in tree.body if isinstance(n, keep))
 
 
+def before_main(code: str) -> str:
+    # A guard-looking line can be inside a string or docstring. Only a real
+    # column-zero `if` token starts the top-level demo we want to discard.
+    lines = code.splitlines(keepends=True)
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(code).readline):
+            if token.type == tokenize.NAME and token.string == "if" and token.start[1] == 0:
+                if re.match(r"if __name__\s*==\s*['\"]__main__['\"]\s*:", token.line):
+                    return "".join(lines[:token.start[0] - 1])
+    except (tokenize.TokenError, IndentationError):
+        pass  # sanitize() handles incomplete replies; raw grading keeps their errors.
+    return code
+
+
 def program(p: dict, text: str, clean: bool) -> str:
     code = extract(text, p["entry_point"])
-    code = re.split(r"^if __name__\s*==\s*['\"]__main__['\"]\s*:", code, maxsplit=1, flags=re.M)[0]
+    code = before_main(code)
     if clean:
         code = sanitize(code)
     if p["entry_point"] and not re.search(rf"^\s*def {re.escape(p['entry_point'])}\s*\(", code, re.M):
