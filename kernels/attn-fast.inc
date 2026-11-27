@@ -545,9 +545,6 @@ static int attnf_mode(void) {
     return mode;
 }
 
-static float * attnf_part = NULL;   // split-mode partials, grown by thread 0 between barriers
-static size_t  attnf_part_cap = 0;
-
 // first / last+1 key a mask row leaves visible, within [0, nkv)
 static void attnf_visible(const ggml_fp16_t * mr, int64_t nkv, int64_t * lo, int64_t * hi) {
     if (!mr) { *lo = 0; *hi = nkv; return; }
@@ -601,12 +598,9 @@ static bool attnf_forward(const struct ggml_compute_params * params, struct ggml
         const int64_t nch = c1 - c0, units = HKV * nch;
         const size_t ps = (size_t) DV + 2;   // [m, l, O[DV]] per row
         const size_t need = (size_t) units * R * ps;
-        if (ith == 0 && need > attnf_part_cap) {
-            free(attnf_part);
-            attnf_part_cap = need + need / 4;
-            attnf_part = (float *) aligned_alloc(64, (attnf_part_cap * sizeof(float) + 63) / 64 * 64);
-            GGML_ASSERT(attnf_part && "attn-fast: out of memory");
-        }
+        // The graph owns this scratch buffer; another context may run attention concurrently.
+        GGML_ASSERT(params->wsize >= need * sizeof(float) + 63);
+        float * attnf_part = (float *) (((uintptr_t) params->wdata + 63) & ~(uintptr_t) 63);
         ggml_barrier(params->threadpool);
         float ml[2 * ATTNF_RMAX];
         // each thread takes a contiguous run of (chunk, head) units, chunk-major: it streams one token range of the
