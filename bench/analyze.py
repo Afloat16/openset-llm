@@ -426,19 +426,21 @@ def multi():
     print("## 7. `serve --multi 4`: aggregate tok/s and per-stream identity, new vs earlier build (interleaved rounds)\n")
     print("| box | round | new multi4 agg | prev multi4 agg | new / prev | new one-stream `--no-spec` | prev one-stream | new multi4 / one | streams identical to alone (new / prev) | new = prev texts | RssAnon peak MiB new / prev | min MemAvailable new / prev |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|")
-    x = []
+    by_class = {}
     for b in sorted({r["_box"] for r in R}):
         for rd in sorted({r["round"] for r in R if r["_box"] == b}):
             v = {r["arm"]: r for r in R if r["_box"] == b and r["round"] == rd}
             if not all(k in v for k in ("new_m4", "prev_m4", "new_one", "prev_one")):
                 continue
-            x.append(v["new_m4"]["agg_tok_s"] / v["prev_m4"]["agg_tok_s"])
-            print(f"| {b} | {rd} | {v['new_m4']['agg_tok_s']:.2f} | {v['prev_m4']['agg_tok_s']:.2f} | {x[-1]:.3f}× | "
+            ratio = v["new_m4"]["agg_tok_s"] / v["prev_m4"]["agg_tok_s"]
+            by_class.setdefault(CLASS.get(b, b), []).append(ratio)
+            print(f"| {b} | {rd} | {v['new_m4']['agg_tok_s']:.2f} | {v['prev_m4']['agg_tok_s']:.2f} | {ratio:.3f}× | "
                   f"{v['new_one']['agg_tok_s']:.2f} | {v['prev_one']['agg_tok_s']:.2f} | {v['new_m4']['agg_tok_s']/v['new_one']['agg_tok_s']:.2f}× | "
                   f"{sum(v['new_m4']['identical_to_alone'])}/4 / {sum(v['prev_m4']['identical_to_alone'])}/4 | "
                   f"{sum(a == c for a, c in zip(v['new_m4']['texts'], v['prev_m4']['texts']))}/4 | "
                   f"{v['new_m4']['rss_anon_peak_kb']//1024} / {v['prev_m4']['rss_anon_peak_kb']//1024} | {v['new_m4']['mem_avail_min_kb']//1024} / {v['prev_m4']['mem_avail_min_kb']//1024} |")
-    print(f"\nnew / prev aggregate: {flag('--multi 4 aggregate tok/s', 'Ice Lake', x)}\n")
+    for cls, ratios in sorted(by_class.items()):
+        print(f"\nnew / prev aggregate ({cls}): {flag('--multi 4 aggregate tok/s', cls, ratios)}\n")
 
 
 def kld():
