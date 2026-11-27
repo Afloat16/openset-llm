@@ -185,7 +185,7 @@ elif [ -n "$BIN_URL" ]; then
   fi
   publish_bin_update
 else
-  stamp="$FORK_SHA portable=$PORTABLE $(cat "$HERE"/patches/*.patch "$HERE"/kernels/* | cksum | cut -d' ' -f1)"
+  stamp="$FORK_SHA portable=$PORTABLE $(cat "$HERE/install.sh" "$HERE/patches/apply.sh" "$HERE"/patches/*.patch "$HERE"/kernels/* | cksum | cut -d' ' -f1)"
 fi
 if [ "$BUILD" = 1 ] && [ -x "$PREFIX/bin/llama-server" ] && [ "$(cat "$PREFIX/bin/.stamp" 2>/dev/null)" = "$stamp" ]; then
   say "Engine already built for this source; skipping the build"
