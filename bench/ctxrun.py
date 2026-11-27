@@ -95,8 +95,24 @@ def wait_gone():
         if subprocess.run(["pgrep", "-x", "llama-server"], capture_output=True).returncode != 0:
             return
         time.sleep(1)
-    subprocess.run(["pkill", "-9", "-x", "llama-server"])
-    time.sleep(3)
+    raise SystemExit("llama-server is still running after 120 s; stop its owner or retry later")
+
+
+def stop_server(proc):
+    try:
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
 
 
 def drop_caches():
@@ -156,25 +172,26 @@ def main():
                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "cmd": " ".join(cmd), "env": spec.get("env", {}),
                "start_meminfo": kv("/proc/meminfo", {"MemAvailable"}), "start_cgroup": cg()}
         t0 = time.time()
-        proc = subprocess.Popen(cmd, stdout=open(log, "w"), stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        with open(log, "w") as output:
+            proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         # the `serve` script execs llama-server, so proc.pid is the server's pid
         # no oom_score_adj anywhere (driver or server); the kernel's own choice under OOM is the 7 GB server
         status = "ok"
-        healthy = False
-        while time.time() - t0 < 2400:
-            if proc.poll() is not None:
-                break
-            try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as r:
-                    if r.status == 200:
-                        healthy = True
-                        break
-            except Exception:
-                pass
-            time.sleep(1)
-        row["load_s"] = round(time.time() - t0, 1)
         samp = None
         try:
+            healthy = False
+            while time.time() - t0 < 2400:
+                if proc.poll() is not None:
+                    break
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as r:
+                        if r.status == 200:
+                            healthy = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(1)
+            row["load_s"] = round(time.time() - t0, 1)
             if not healthy:
                 status = "died_at_load" if proc.poll() is not None else "not_healthy"
                 raise RuntimeError(status)
@@ -208,41 +225,38 @@ def main():
             if status == "ok":
                 status = "died" if proc.poll() is not None else f"error: {type(e).__name__}: {e}"[:300]
         finally:
-            if samp:
-                samp.stop = True
-                row.update({"peak_anon_kB": samp.peak_anon, "min_avail_kB": samp.min_avail, "peak_cgroup_kB": samp.peak_cg})
-            rc = proc.poll()
-            if rc is None:
-                os.killpg(proc.pid, signal.SIGINT)
-                try:
-                    proc.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
-            else:
-                row["exit_code"] = rc
-            row["status"] = status
             try:
-                k = subprocess.run(["bash", "-c", "dmesg 2>/dev/null | grep -i -E 'killed process|out of memory' | tail -3 || sudo -n dmesg 2>/dev/null | grep -i -E 'killed process|out of memory' | tail -3"],
-                                   capture_output=True, text=True, timeout=20).stdout.strip()
-                row["dmesg_oom"] = k[-600:]
-            except Exception:
-                pass
-            if status != "ok":
-                row["log_tail"] = open(log, errors="replace").read()[-2500:]
-            with open(a.out, "a") as f:
-                f.write(json.dumps(row) + "\n")
-            if j["mode"] == "fill" and status != "ok":
-                failed[j["arm"]] = min(failed.get(j["arm"], 1 << 30), C)
-            msg = f"{tag:40s} {status:12s}"
-            if row.get("decode_tok_s"):
-                msg += (f" pp {row['prefill_tok_s']:.1f} tok/s ({row['prompt_n']} tok, {row['prompt_ms']/1000:.0f} s)"
-                        f" tg {row['decode_tok_s']:.2f} recall {sum(row['recall'])}/5"
-                        f" anon {row['snap_after']['proc'].get('RssAnon', 0)//1024} MiB peak {row.get('peak_anon_kB', 0)//1024}"
-                        f" minavail {row.get('min_avail_kB', 0)//1024} cg {row.get('peak_cgroup_kB', 0)//1024}")
-            elif row.get("snap_idle"):
-                msg += f" idle anon {row['snap_idle']['proc'].get('RssAnon', 0)//1024} MiB HWM {row['snap_idle']['proc'].get('VmHWM', 0)//1024}"
-            print(time.strftime("%H:%M:%S"), msg, file=sys.stderr, flush=True)
+                if samp:
+                    samp.stop = True
+                    samp.join()
+                    row.update({"peak_anon_kB": samp.peak_anon, "min_avail_kB": samp.min_avail, "peak_cgroup_kB": samp.peak_cg})
+            finally:
+                rc = proc.poll()
+                if rc is not None:
+                    row["exit_code"] = rc
+                stop_server(proc)
+        row["status"] = status
+        try:
+            k = subprocess.run(["bash", "-c", "dmesg 2>/dev/null | grep -i -E 'killed process|out of memory' | tail -3 || sudo -n dmesg 2>/dev/null | grep -i -E 'killed process|out of memory' | tail -3"],
+                               capture_output=True, text=True, timeout=20).stdout.strip()
+            row["dmesg_oom"] = k[-600:]
+        except Exception:
+            pass
+        if status != "ok":
+            row["log_tail"] = open(log, errors="replace").read()[-2500:]
+        with open(a.out, "a") as f:
+            f.write(json.dumps(row) + "\n")
+        if j["mode"] == "fill" and status != "ok":
+            failed[j["arm"]] = min(failed.get(j["arm"], 1 << 30), C)
+        msg = f"{tag:40s} {status:12s}"
+        if row.get("decode_tok_s"):
+            msg += (f" pp {row['prefill_tok_s']:.1f} tok/s ({row['prompt_n']} tok, {row['prompt_ms']/1000:.0f} s)"
+                    f" tg {row['decode_tok_s']:.2f} recall {sum(row['recall'])}/5"
+                    f" anon {row['snap_after']['proc'].get('RssAnon', 0)//1024} MiB peak {row.get('peak_anon_kB', 0)//1024}"
+                    f" minavail {row.get('min_avail_kB', 0)//1024} cg {row.get('peak_cgroup_kB', 0)//1024}")
+        elif row.get("snap_idle"):
+            msg += f" idle anon {row['snap_idle']['proc'].get('RssAnon', 0)//1024} MiB HWM {row['snap_idle']['proc'].get('VmHWM', 0)//1024}"
+        print(time.strftime("%H:%M:%S"), msg, file=sys.stderr, flush=True)
     print("# CTXRUN_DONE", file=sys.stderr, flush=True)
 
 
