@@ -234,7 +234,7 @@ index ee2de80..40e52f2 100644
  
          cur.data_tgt = std::move(spare_tgt);
          cur.data_dft = std::move(spare_dft);
-@@ -2403,6 +2578,164 @@ private:
+@@ -2403,6 +2578,169 @@ private:
                  cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
      }
  
@@ -299,6 +299,11 @@ index ee2de80..40e52f2 100644
 +        const auto & in = slot.task->tokens;
 +        const int32_t n_new = slot.task->n_tokens();
 +        if (rsm.dir.empty()) {
++            return false;
++        }
++        // Adapter weights and per-request scales are not part of the disk-cache namespace.
++        // Keep adapted requests out of it until their state can be keyed independently.
++        if (std::any_of(slot.lora.begin(), slot.lora.end(), [](const auto & adapter) { return adapter.scale != 0.0f; })) {
 +            return false;
 +        }
 +        if (rsm_env_hash == 0) {

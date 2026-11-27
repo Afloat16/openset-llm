@@ -376,6 +376,9 @@ The adapter loads, changes the output and tool calls stay well-formed; speculati
 same rate. On 8 GB use `--no-spec` with an adapter, or a machine with more memory. Not measured: whether an adapter
 trained on the full-precision model improves this ternary build on any task.
 
+Requests with an active adapter do not read or write the shared prefix states on disk, which belong to the base model.
+Prompt reuse and checkpoints in memory still work.
+
 ## Several requests at once (`--multi`)
 
 `./serve --multi N` serves N requests together: every pass over the ~6 GB of weights produces one token for each of
