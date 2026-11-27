@@ -69,9 +69,19 @@ typedef struct {
     int8_t * K8;      // [T][DMAX]      kv4/5/6: K tile unpacked to int8 levels
 } attnf_ws;
 
+struct attnf_ws_owner {
+    attnf_ws * value = NULL;
+    ~attnf_ws_owner() {
+        if (value) {
+            free(value->Q);   // Q is the first slice of the aligned allocation
+            free(value);
+        }
+    }
+};
+
 static attnf_ws * attnf_ws_get(void) {
-    static thread_local attnf_ws * ws = NULL;
-    if (ws) return ws;
+    static thread_local attnf_ws_owner owner;
+    if (owner.value) return owner.value;
     const size_t RD = (size_t) ATTNF_RMAX * ATTNF_DMAX, TD = (size_t) ATTNF_T * ATTNF_DMAX, RT = (size_t) ATTNF_RMAX * ATTNF_T;
     const size_t bytes = sizeof(float) * (RD + ATTNF_RMAX + TD + TD + RT + RT + RD + RD) + 2 * RD + TD + 64 * 16;
     char * p = (char *) aligned_alloc(64, (bytes + 63) / 64 * 64);
@@ -85,8 +95,8 @@ static attnf_ws * attnf_ws_get(void) {
     ATTNF_TAKE(w->Mt, float, RT); ATTNF_TAKE(w->O, float, RD);    ATTNF_TAKE(w->OF, float, RD);
     ATTNF_TAKE(w->K8, int8_t, TD);
 #undef ATTNF_TAKE
-    ws = w;
-    return ws;
+    owner.value = w;
+    return owner.value;
 }
 
 static const int8_t attnf_zero_row[ATTNF_DMAX] = {0};
