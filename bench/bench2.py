@@ -20,6 +20,7 @@ import json
 import os
 import random
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -47,29 +48,43 @@ def start(arm: str, spec: dict, logdir: str, tag: str) -> tuple[int, subprocess.
     env = dict(os.environ, **{k: v.replace("@H@", H) for k, v in spec.get("env", {}).items()})
     port = free_port()
     log = os.path.join(logdir, f"{arm}.{tag}.log")
-    proc = subprocess.Popen(shlex.split(spec["cmd"].replace("@H@", H)) + ["--host", "127.0.0.1", "--port", str(port)],
-                            stdout=open(log, "w"), stderr=subprocess.STDOUT, env=env)
-    t0 = time.time()
-    while time.time() - t0 < 1200:
-        if proc.poll() is not None:
-            sys.exit(f"server {arm} died; tail of {log}:\n" + open(log).read()[-3000:])
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as r:
-                if r.status == 200:
-                    return port, proc, log
-        except Exception:
-            pass
-        time.sleep(1)
-    proc.kill()
-    sys.exit(f"server {arm} not healthy after 1200 s")
+    with open(log, "w") as output:
+        proc = subprocess.Popen(shlex.split(spec["cmd"].replace("@H@", H)) + ["--host", "127.0.0.1", "--port", str(port)],
+                                stdout=output, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 1200:
+            if proc.poll() is not None:
+                with open(log) as output:
+                    raise SystemExit(f"server {arm} died; tail of {log}:\n" + output.read()[-3000:])
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as r:
+                    if r.status == 200:
+                        return port, proc, log
+            except Exception:
+                pass
+            time.sleep(1)
+        raise SystemExit(f"server {arm} not healthy after 1200 s")
+    except BaseException:
+        stop(proc)
+        raise
 
 
 def stop(proc: subprocess.Popen) -> None:
-    proc.terminate()
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     try:
         proc.wait(timeout=120)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        pass
+    finally:
+        # A wrapper may exit before its server children; they belong to this arm too.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         proc.wait()
 
 
