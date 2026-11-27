@@ -53,11 +53,13 @@ def main() -> None:
         if vtype == GGUFValueType.ARRAY:
             sub = f.types[-1]
             if sub == GGUFValueType.STRING:
-                w.add_array(name, [bytes(f.parts[i]).decode("utf-8", errors="surrogateescape") for i in f.data])
+                values = [bytes(f.parts[i]) for i in f.data]
             else:
-                w.add_array(name, [f.parts[i][0].item() for i in f.data])
+                values = [f.parts[i][0].item() for i in f.data]
+            if values:
+                w.add_key_value(name, values, vtype, sub_type=sub)
         elif vtype == GGUFValueType.STRING:
-            w.add_string(name, bytes(f.parts[-1]).decode("utf-8", errors="surrogateescape"))
+            w.add_key_value(name, bytes(f.parts[-1]), vtype)
         else:
             w.add_key_value(name, f.parts[-1][0].item(), vtype)
     w.add_uint32(f"{arch}.nextn_predict_layers", 1)
