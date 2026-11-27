@@ -54,8 +54,8 @@ index e8797a07..ee2de806 100644
 +    }
 +
 +    int adapt_choose() {
-+        const int dmax = std::min(adapt_dmax, 8);
-+        const int dmin = std::min(adapt_dmin(), dmax);
++        const int dmax = std::max(0, std::min(adapt_dmax, 8));
++        const int dmin = std::max(0, std::min(adapt_dmin(), dmax));
 +        adapt_steps++;
 +        double q[8];
 +        for (int i = 0; i < dmax; ++i) {
