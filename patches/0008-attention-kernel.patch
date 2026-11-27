@@ -10,6 +10,29 @@ index 94dead3..eef8b99 100644
  };
  
  static ggml_type kv_cache_type_from_str(const std::string & s) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3021,7 +3021,17 @@ struct ggml_cplan ggml_graph_plan(
+                         size_t n_chunks = n_tasks;
+                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+-
++
+-                        cur += MAX(prefill, decode);
++                        // attn-fast.inc splits small query groups over canonical 1024-key chunks.
++                        // Reserve their partials in this graph's workspace, not a process-global buffer.
++                        const int64_t neq1 = node->src[0]->ne[1];
++                        const int64_t nek1 = node->src[1]->ne[1];
++                        const int64_t nek2 = node->src[1]->ne[2];
++                        size_t grouped = 0;
++                        if (nek2 > 0 && neq2 % nek2 == 0 && neq1 * (neq2 / nek2) <= 48) {
++                            grouped = sizeof(float)*neq1*neq2*((nek1 + 1023)/1024)*(2+DV) + 63;
++                        }
++
++                        cur += MAX(MAX(prefill, decode), grouped);
+                     } break;
+                 case GGML_OP_FLASH_ATTN_BACK:
+                     {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 index 6884720..12f84df 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
