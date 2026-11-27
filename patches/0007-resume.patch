@@ -16,7 +16,7 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 index ee2de80..40e52f2 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -43,6 +43,149 @@ extern "C" int  llama_x1_draft_list_ready(void);
+@@ -43,6 +43,151 @@ extern "C" int  llama_x1_draft_list_ready(void);
  extern "C" int  llama_x1_draft_list_has(int32_t t);
  extern "C" void llama_x1_draft_set_full(int full);
  
@@ -81,7 +81,7 @@ index ee2de80..40e52f2 100644
 +    for (llama_token x : t) { h ^= (uint32_t) x; h *= 1099511628211ULL; }
 +    return (h ^ (uint64_t) t.size()) * 31 + rsm_env_hash;   // the file name keys the tokens AND the environment
 +}
-+// what else a saved state depends on: the model file (path, size, FNV of its first MiB), this binary (size + mtime of
++// what else a saved state depends on: the model file (path, size, mtime, FNV of its first MiB), this binary (size + mtime of
 +// /proc/self/exe: any patch or kernel change rebuilds it), KV types, flash-attention mode, whether a draft context
 +// exists, and every GGML_* / LLAMA_* / X1_* environment variable (kernel modes, X1/X2 switches), LLAMA_RESUME* excepted
 +static uint64_t rsm_fnv(uint64_t h, const void * p, size_t n) {
@@ -95,6 +95,8 @@ index ee2de80..40e52f2 100644
 +static std::string rsm_env_desc(const std::string & model_path, int type_k, int type_v, int fa, bool has_dft) {
 +    std::error_code ec;
 +    std::string d = "model=" + model_path + " size=" + std::to_string((unsigned long long) std::filesystem::file_size(model_path, ec));
++    const auto mt = std::filesystem::last_write_time(model_path, ec).time_since_epoch().count();
++    d += " mtime=" + (ec ? std::string("unavailable") : std::to_string((long long) mt));
 +    {
 +        std::ifstream f(model_path, std::ios::binary);
 +        std::vector<char> head(1 << 20);
