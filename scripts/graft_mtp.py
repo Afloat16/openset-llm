@@ -32,13 +32,15 @@ def main() -> None:
     from gguf import GGUFReader, GGUFWriter, GGUFValueType
 
     base, side = GGUFReader(a.base), GGUFReader(a.sidecar)
+    if base.endianess != side.endianess:
+        p.error("base and sidecar must have the same byte order")
     arch = bytes(base.fields["general.architecture"].parts[-1]).decode()
     n_layer = int(base.fields[f"{arch}.block_count"].parts[-1][0])
     graft = [t for t in side.tensors if t.name.startswith(f"blk.{n_layer}.")]
     if not graft:
         sys.exit(f"sidecar has no blk.{n_layer}.* tensors")
 
-    w = GGUFWriter(a.out, arch)
+    w = GGUFWriter(a.out, arch, endianess=base.endianess)
     skip = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count", "general.architecture"}
     for name, f in base.fields.items():
         if name in skip:
@@ -70,7 +72,7 @@ def main() -> None:
     w.write_kv_data_to_file()
     w.write_ti_data_to_file()
     for t in list(base.tensors) + graft:
-        w.write_tensor_data(t.data)
+        w.write_tensor_data(t.data, tensor_endianess=base.endianess)
     w.close()
     print(f"wrote {a.out}: {len(base.tensors)} base + {len(graft)} grafted tensors "
           f"({sum(int(t.n_bytes) for t in graft) / 1e6:.0f} MB), block_count {n_layer} -> {n_layer + 1}")
