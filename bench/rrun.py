@@ -76,6 +76,7 @@ def stream_chat(body):
     t0 = time.time()
     ttft = None
     content, calls, timings = "", {}, {}
+    complete = False
     with urllib.request.urlopen(req, timeout=7200) as r:
         for raw in r:
             line = raw.decode().strip()
@@ -83,8 +84,11 @@ def stream_chat(body):
                 continue
             data = line[5:].strip()
             if data == "[DONE]":
+                complete = True
                 break
             ev = json.loads(data)
+            if "error" in ev:
+                raise RuntimeError(f"stream error: {ev['error']}")
             if "timings" in ev:
                 timings = ev["timings"]
             for ch in ev.get("choices", []):
@@ -103,6 +107,8 @@ def stream_chat(body):
                     got = True
                 if got and ttft is None:
                     ttft = time.time() - t0
+    if not complete:
+        raise RuntimeError("stream ended before [DONE]")
     wall = time.time() - t0
     return ttft, wall, content, [calls[k] for k in sorted(calls)], timings
 
