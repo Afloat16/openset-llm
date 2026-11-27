@@ -20,7 +20,7 @@
 #   quality                 GSM8K-40 + 160 coding problems, new default vs the earlier build's default (task-quality gate for 0008)
 #   kld                     KL divergence of every attention path (-ub 1/4/512, GGML_ATTN 1/0) vs the fork's tiled path
 #   ppl                     WikiText-2 PPL, 32 x 512: the release build, and GGML_ATTN=0
-set -u
+set -euo pipefail
 L=${L:-$(cd "$(dirname "$0")" && pwd)}; R=~/res; mkdir -p $R   # L = this bench/ folder
 REPLAY=${REPLAY:-$L/replay.json}   # agent-replay input (not shipped; see README.md)
 BROAD=${BROAD:-$L/prompts_broad.jsonl}
@@ -60,7 +60,8 @@ replay() {
     [ -f $O/steps_$arm.done ] && continue
     log "replay $arm start"
     python3 rrun.py --arms arms_replay.json --arm $arm --replay $REPLAY ${REPLAY_TOKENS:+--tokens $REPLAY_TOKENS} --ctx 16384 \
-      --gen 64 $st --out $O > $O/$arm.out 2>&1 && touch $O/steps_$arm.done
+      --gen 64 $st --out $O > $O/$arm.out 2>&1
+    touch $O/steps_$arm.done
     log "replay $arm end"
   done
 }
@@ -154,8 +155,9 @@ ppl() {
   O=$R/ppl; mkdir -p $O
   if [ ! -x ~/.prev/bin/llama-perplexity ]; then   # the earlier build tree was pruned after install
     S=~/.prev/llama.cpp; cmake -S $S -B $S/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
-      -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF > $O/build-prev.log 2>&1 && \
-      cmake --build $S/build -j 8 --target llama-perplexity >> $O/build-prev.log 2>&1 && cp $S/build/bin/llama-perplexity ~/.prev/bin/
+      -DLLAMA_BUILD_EXAMPLES=OFF -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF > $O/build-prev.log 2>&1
+    cmake --build $S/build -j 8 --target llama-perplexity >> $O/build-prev.log 2>&1
+    cp $S/build/bin/llama-perplexity ~/.prev/bin/
   fi
   for a in new attn0 prev; do
     E=; [ $a = attn0 ] && E="GGML_ATTN=0"; B=~/.openset-llm/bin; [ $a = prev ] && B=~/.prev/bin
