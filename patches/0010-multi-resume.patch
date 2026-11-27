@@ -83,11 +83,12 @@ index 3ac30a7..b81ed57 100644
              bytes += sp.size();
          } else {
              std::filesystem::remove(rsm_path(h, "spec"), ec);
-@@ -2730,6 +2766,8 @@ private:
+@@ -2730,6 +2766,9 @@ private:
          if (ok) {
              std::filesystem::rename(tmp_t, ft, ec);   // the .tgt file appears last: it marks a complete set
              ok = !ec;
-+        } else {
++        }
++        if (!ok) {
 +            std::filesystem::remove(tmp_t, ec);
          }
          SLT_INF(slot, "resume: %s the %d-token prefix state (%.1f MiB) in %.2f s\n", ok ? "wrote" : "FAILED to write", p,
