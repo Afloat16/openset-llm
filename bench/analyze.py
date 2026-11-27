@@ -339,7 +339,10 @@ def replay():
                 r = S[a].get(k)
                 cells.append(f"{r['prompt_n']} / {r['wall_s']}" if r and r.get("wall_s") else ("died" if r else "–"))
             print(f"| {k[1]} | {n} | " + " | ".join(cells) + " |")
-        ok = lambda a, k: k in S[a] and S[a][k].get("wall_s")
+        def successful(a, k):
+            r = S[a].get(k)
+            return r is not None and not r.get("error") and r.get("wall_s") is not None
+        ok = lambda a, k: successful(a, k) and S[a][k]["wall_s"] > 0
         if "ours" in S:
             print()
             print("| arm | steps (paired with ours) | sum wall s | s per step | ours, same steps | arm / ours (sum) | per-step ratio, steps ≥ 1: median [min, max] |")
@@ -360,10 +363,13 @@ def replay():
                     if a.startswith("prev") and x:
                         flag(f"agent step seconds vs {a} (prev/new)", b, x)
             OUT.setdefault("replay", {}).setdefault(b, {})["_tot"] = tot
-            full = [k for k in steps if k in S["ours"] and S["ours"][k].get("wall_s")]
-            print(f"- ours over all {len(full)} steps: {sum(S['ours'][k]['wall_s'] for k in full):.0f} s, "
-                  f"{sum(S['ours'][k]['wall_s'] for k in full)/len(full):.0f} s/step; prompt tokens read "
-                  f"{sum(S['ours'][k]['prompt_n'] or 0 for k in full if k[1] >= 1)} over steps 1–{full[-1][1]}")
+            full = [k for k in steps if successful("ours", k)]
+            if full:
+                print(f"- ours over all {len(full)} steps: {sum(S['ours'][k]['wall_s'] for k in full):.0f} s, "
+                      f"{sum(S['ours'][k]['wall_s'] for k in full)/len(full):.0f} s/step; prompt tokens read "
+                      f"{sum(S['ours'][k]['prompt_n'] or 0 for k in full if k[1] >= 1)} over steps 1–{full[-1][1]}")
+            else:
+                print("- ours: no successful replay steps.")
             acc = [(S["ours"][k].get("draft_n") or 0, S["ours"][k].get("draft_n_accepted") or 0) for k in full]
             if sum(d for d, _ in acc):
                 print(f"- draft acceptance on the replay (ours): {sum(a for _, a in acc) / sum(d for d, _ in acc):.2f}")
@@ -372,7 +378,9 @@ def replay():
                     base = "ours" if other == "ours_nr" else "ours_ns"
                     if base not in S:
                         continue
-                    ks = [k for k in S[base] if k in S[other]]
+                    ks = [k for k in S[base] if successful(base, k) and successful(other, k)]
+                    if not ks:
+                        continue
                     same = sum(1 for k in ks if S[base][k]["text"] == S[other][k]["text"] and S[base][k]["tool_calls"] == S[other][k]["tool_calls"])
                     print(f"- identity {base} (resume) vs {other} (`--no-resume`): **{same}/{len(ks)}** requests byte-identical (content + tool calls)")
                     OUT.setdefault("ident", {})[f"replay {b} {base} vs {other}"] = (same, len(ks))
