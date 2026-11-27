@@ -14,6 +14,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import tempfile
 
 
 def main() -> None:
@@ -47,40 +48,47 @@ def main() -> None:
     if not graft:
         sys.exit(f"sidecar has no blk.{n_layer}.* tensors")
 
-    w = GGUFWriter(a.out, arch, endianess=base.endianess)
-    skip = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count", "general.architecture"}
-    for name, f in base.fields.items():
-        if name in skip:
-            continue
-        vtype = f.types[0]
-        if name == "general.alignment":
-            w.add_custom_alignment(int(f.parts[-1][0]))
-            continue
-        if name == f"{arch}.block_count":
-            w.add_uint32(name, n_layer + 1)
-            continue
-        if vtype == GGUFValueType.ARRAY:
-            sub = f.types[-1]
-            if sub == GGUFValueType.STRING:
-                values = [bytes(f.parts[i]) for i in f.data]
-            else:
-                values = [f.parts[i][0].item() for i in f.data]
-            if values:
-                w.add_key_value(name, values, vtype, sub_type=sub)
-        elif vtype == GGUFValueType.STRING:
-            w.add_key_value(name, bytes(f.parts[-1]), vtype)
-        else:
-            w.add_key_value(name, f.parts[-1][0].item(), vtype)
-    w.add_uint32(f"{arch}.nextn_predict_layers", 1)
+    # Keep an existing output usable until the whole replacement has been written and closed.
+    # The staging directory is on the output filesystem, so publication is one atomic rename.
+    with tempfile.TemporaryDirectory(prefix=f".{output.name}.", dir=output.parent) as staging:
+        staged_output = Path(staging) / output.name
+        w = GGUFWriter(str(staged_output), arch, endianess=base.endianess)
+        try:
+            skip = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count", "general.architecture"}
+            for name, f in base.fields.items():
+                if name in skip:
+                    continue
+                vtype = f.types[0]
+                if name == "general.alignment":
+                    w.add_custom_alignment(int(f.parts[-1][0]))
+                    continue
+                if name == f"{arch}.block_count":
+                    w.add_uint32(name, n_layer + 1)
+                    continue
+                if vtype == GGUFValueType.ARRAY:
+                    sub = f.types[-1]
+                    if sub == GGUFValueType.STRING:
+                        values = [bytes(f.parts[i]) for i in f.data]
+                    else:
+                        values = [f.parts[i][0].item() for i in f.data]
+                    if values:
+                        w.add_key_value(name, values, vtype, sub_type=sub)
+                elif vtype == GGUFValueType.STRING:
+                    w.add_key_value(name, bytes(f.parts[-1]), vtype)
+                else:
+                    w.add_key_value(name, f.parts[-1][0].item(), vtype)
+            w.add_uint32(f"{arch}.nextn_predict_layers", 1)
 
-    for t in list(base.tensors) + graft:
-        w.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.n_bytes, raw_dtype=t.tensor_type)
-    w.write_header_to_file()
-    w.write_kv_data_to_file()
-    w.write_ti_data_to_file()
-    for t in list(base.tensors) + graft:
-        w.write_tensor_data(t.data, tensor_endianess=base.endianess)
-    w.close()
+            for t in list(base.tensors) + graft:
+                w.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.n_bytes, raw_dtype=t.tensor_type)
+            w.write_header_to_file()
+            w.write_kv_data_to_file()
+            w.write_ti_data_to_file()
+            for t in list(base.tensors) + graft:
+                w.write_tensor_data(t.data, tensor_endianess=base.endianess)
+        finally:
+            w.close()
+        os.replace(staged_output, output)
     print(f"wrote {a.out}: {len(base.tensors)} base + {len(graft)} grafted tensors "
           f"({sum(int(t.n_bytes) for t in graft) / 1e6:.0f} MB), block_count {n_layer} -> {n_layer + 1}")
 
