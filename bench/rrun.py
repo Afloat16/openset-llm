@@ -232,53 +232,62 @@ def main():
     data = json.load(open(a.replay))
     name = a.arm + a.tag
     srv, pid, cmd = start_server(arm, a, out, a.tag)
-    meta = {"arm": a.arm, "tag": a.tag, "cmd": cmd, "env": arm.get("env", {}), "ctx": a.ctx, "gen": a.gen,
-            "replay": a.replay, "t_start": time.strftime("%FT%TZ", time.gmtime()),
-            "rss_after_load_mb": status_kb(pid, "VmRSS") // 1024, "anon_after_load_mb": status_kb(pid, "RssAnon") // 1024,
-            "mem_available_after_load_mb": mem_available_mb()}
-    if a.dump_tokens:
-        dump = {}
-        for req in data["requests"]:
-            tools = data.get("tools") or None
-            tmpl = post("/apply-template", {"messages": req["messages"], "chat_template_kwargs": {"enable_thinking": False}} |
-                        ({"tools": tools} if tools else {}))["prompt"]
-            dump[req["step"]] = post("/tokenize", {"content": tmpl, "add_special": False, "parse_special": True})["tokens"]
-        Path(a.dump_tokens).write_text(json.dumps(dump))
-        stop_server(srv)
-        return
-    rows_f = open(out / f"steps_{name}.jsonl", "w")
-    prev = []
-    reqs = data["requests"][: a.steps] if a.steps else data["requests"]
-    replies = []
-    for req in reqs:
-        if a.live:   # closed loop: the k-th assistant message is what this server answered at step k
-            req = dict(req, messages=[dict(m) for m in req["messages"]])
-            k = 0
-            for m in req["messages"]:
-                if m["role"] == "assistant":
-                    m["content"] = replies[k]
-                    k += 1
-        row, prev = run_step(a, data, req, prev, pid, name, {"session": 1})
-        replies.append(row["text"])
-        rows_f.write(json.dumps(row) + "\n")
-        rows_f.flush()
-        print(json.dumps({k: v for k, v in row.items() if k not in ("text", "tool_calls")}), flush=True)
-        if row["error"] or srv.poll() is not None:
-            meta["died_at_step"] = req["step"]
-            break
-    meta["anon_end_mb"] = status_kb(pid, "RssAnon") // 1024
-    meta["mem_available_end_mb"] = mem_available_mb()
-    if a.restart_step0 and "died_at_step" not in meta:
-        stop_server(srv)
-        subprocess.run("sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null", shell=True)
-        srv, pid, _ = start_server(arm, a, out, a.tag + "_restart")
-        row, _ = run_step(a, data, data["requests"][0], [], pid, name, {"session": 2})
-        rows_f.write(json.dumps(row) + "\n")
-        rows_f.flush()
-        print(json.dumps({k: v for k, v in row.items() if k not in ("text", "tool_calls")}), flush=True)
-    stop_server(srv)
-    meta["t_end"] = time.strftime("%FT%TZ", time.gmtime())
-    (out / f"meta_{name}.json").write_text(json.dumps(meta, indent=1))
+    rows_f = None
+    try:
+        meta = {"arm": a.arm, "tag": a.tag, "cmd": cmd, "env": arm.get("env", {}), "ctx": a.ctx, "gen": a.gen,
+                "replay": a.replay, "t_start": time.strftime("%FT%TZ", time.gmtime()),
+                "rss_after_load_mb": status_kb(pid, "VmRSS") // 1024, "anon_after_load_mb": status_kb(pid, "RssAnon") // 1024,
+                "mem_available_after_load_mb": mem_available_mb()}
+        if a.dump_tokens:
+            dump = {}
+            for req in data["requests"]:
+                tools = data.get("tools") or None
+                tmpl = post("/apply-template", {"messages": req["messages"], "chat_template_kwargs": {"enable_thinking": False}} |
+                            ({"tools": tools} if tools else {}))["prompt"]
+                dump[req["step"]] = post("/tokenize", {"content": tmpl, "add_special": False, "parse_special": True})["tokens"]
+            Path(a.dump_tokens).write_text(json.dumps(dump))
+            return
+        rows_f = open(out / f"steps_{name}.jsonl", "w")
+        prev = []
+        reqs = data["requests"][: a.steps] if a.steps else data["requests"]
+        replies = []
+        for req in reqs:
+            if a.live:   # closed loop: the k-th assistant message is what this server answered at step k
+                req = dict(req, messages=[dict(m) for m in req["messages"]])
+                k = 0
+                for m in req["messages"]:
+                    if m["role"] == "assistant":
+                        m["content"] = replies[k]
+                        k += 1
+            row, prev = run_step(a, data, req, prev, pid, name, {"session": 1})
+            replies.append(row["text"])
+            rows_f.write(json.dumps(row) + "\n")
+            rows_f.flush()
+            print(json.dumps({k: v for k, v in row.items() if k not in ("text", "tool_calls")}), flush=True)
+            if row["error"] or srv.poll() is not None:
+                meta["died_at_step"] = req["step"]
+                break
+        meta["anon_end_mb"] = status_kb(pid, "RssAnon") // 1024
+        meta["mem_available_end_mb"] = mem_available_mb()
+        if a.restart_step0 and "died_at_step" not in meta:
+            stop_server(srv)
+            srv = None
+            subprocess.run("sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null", shell=True)
+            srv, pid, _ = start_server(arm, a, out, a.tag + "_restart")
+            row, _ = run_step(a, data, data["requests"][0], [], pid, name, {"session": 2})
+            rows_f.write(json.dumps(row) + "\n")
+            rows_f.flush()
+            print(json.dumps({k: v for k, v in row.items() if k not in ("text", "tool_calls")}), flush=True)
+        meta["t_end"] = time.strftime("%FT%TZ", time.gmtime())
+        (out / f"meta_{name}.json").write_text(json.dumps(meta, indent=1))
+    finally:
+        try:
+            if rows_f is not None:
+                rows_f.close()
+        finally:
+            if srv is not None:
+                stop_server(srv)
+
 
 
 if __name__ == "__main__":
