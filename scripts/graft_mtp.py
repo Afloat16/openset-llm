@@ -33,6 +33,13 @@ def main() -> None:
 
     base, side = GGUFReader(a.base), GGUFReader(a.sidecar)
     arch = bytes(base.fields["general.architecture"].parts[-1]).decode()
+    side_arch = bytes(side.fields["general.architecture"].parts[-1]).decode()
+    if side_arch != arch:
+        p.error(f"sidecar architecture {side_arch!r} does not match base architecture {arch!r}")
+    embedding_key = f"{arch}.embedding_length"
+    if embedding_key in base.fields and embedding_key in side.fields:
+        if int(base.fields[embedding_key].parts[-1][0]) != int(side.fields[embedding_key].parts[-1][0]):
+            p.error("sidecar embedding length must match the base model")
     n_layer = int(base.fields[f"{arch}.block_count"].parts[-1][0])
     graft = [t for t in side.tensors if t.name.startswith(f"blk.{n_layer}.")]
     if not graft:
