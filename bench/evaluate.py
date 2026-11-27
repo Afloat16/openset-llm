@@ -20,11 +20,14 @@ import sys
 import tempfile
 import tokenize
 
-FENCE = re.compile(r"```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\n(.*?)(?:```|\Z)", re.S)
+# A closing fence occupies its own line and is at least as long as the opener.
+# Inline backticks and shorter fences are part of the generated Python source.
+FENCE = re.compile(r"^ {0,3}(`{3,})[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n"
+                   r"(.*?)(?:^ {0,3}\1`*[ \t]*(?:\r?\n|\Z)|\Z)", re.M | re.S)
 
 
 def extract(text: str, entry: str) -> str:
-    blocks = [b for lang, b in FENCE.findall(text) if lang.lower() in ("", "python", "py", "python3")]
+    blocks = [b for _, lang, b in FENCE.findall(text) if lang.lower() in ("", "python", "py", "python3")]
     if not blocks:
         return text
     for b in blocks:
