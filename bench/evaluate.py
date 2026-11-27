@@ -82,8 +82,10 @@ def run(src: str) -> tuple[bool, str]:
     with tempfile.TemporaryDirectory() as d:
         f = os.path.join(d, "prog.py")
         open(f, "w").write(src)
-        with subprocess.Popen([sys.executable, "-I", f], cwd=d, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              preexec_fn=limits, stdin=subprocess.DEVNULL, text=True) as proc:
+        # Only the exit status and the last stderr line affect grading. Generated
+        # programs may write arbitrary bytes; decoding them must not abort the batch.
+        with subprocess.Popen([sys.executable, "-I", f], cwd=d, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              preexec_fn=limits, stdin=subprocess.DEVNULL, text=True, errors="replace") as proc:
             try:
                 try:
                     _, stderr = proc.communicate(timeout=10)
