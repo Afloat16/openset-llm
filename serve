@@ -62,7 +62,14 @@ for numeric_name in PORT THREADS CTX MULTI DEPTH; do
   numeric_value=${!numeric_name}
   [ -n "$numeric_value" ] || continue
   numeric_value=${numeric_value#"${numeric_value%%[!0]*}"}
-  printf -v "$numeric_name" '%s' "${numeric_value:-0}"
+  numeric_value=${numeric_value:-0}
+  # llama-server parses these options as signed 32-bit integers. Check strings
+  # before Bash arithmetic can wrap an oversized context into a different value.
+  if [ "${#numeric_value}" -gt 10 ] || { [ "${#numeric_value}" -eq 10 ] && [[ $numeric_value > 2147483647 ]]; }; then
+    echo "--port, --ctx, --threads, --multi and --spec-depth must not exceed 2147483647 (got: $numeric_value)" >&2
+    exit 2
+  fi
+  printf -v "$numeric_name" '%s' "$numeric_value"
 done
 CKPT=1; RESUME_MODE=full
 if [ "$MULTI" -ge 2 ]; then
@@ -72,6 +79,7 @@ if [ "$MULTI" -ge 2 ]; then
   [ "$SPEC" = 1 ] && echo "note: --multi turns speculation off (the two together are untested)" >&2
   SPEC=0
   [ -z "$CTX" ] && { [ "$MULTI" -le 4 ] && CTX=2048 || CTX=1024; }
+  [ "$CTX" -le $((2147483647 / MULTI)) ] || { echo "--ctx times --multi must not exceed 2147483647" >&2; exit 2; }
   NP=$MULTI; CTX_TOTAL=$((CTX * MULTI)); CKPT=0
   # Resume with several streams (0010; measured 2026-11-25 on 8 vCPU / 8 GB boxes with 2, 4 and 6 streams): the state at
   # the end of the system(+tools) prompt is written to disk once and loaded by every stream that cannot continue what it
